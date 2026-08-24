@@ -198,10 +198,10 @@ Not yet ported/decoded (see `docs/DJI_R_SDK_Protocol.md` §Status for the full l
 
 ```
 firmware/esp32-gimbal-bridge/
-  platformio.ini           PlatformIO env (XIAO + MCP2515 hat; optional C6 TWAI)
+  platformio.ini           PlatformIO env (XIAO C3 + MCP2515 hat)
   src/
     main.cpp                WiFi/WebSocket/REST glue, safety watchdog
-    can_hw.h/.cpp           MCP2515 (hat) or TWAI (C6) CAN backend
+    can_hw.h/.cpp           MCP2515 CAN backend for the Seeed hat
     dji_can_protocol.h/.cpp  Packet framing ported from dji_gimbal_cli.py
   data/
     index.html               Joystick + telemetry web UI (served via LittleFS)

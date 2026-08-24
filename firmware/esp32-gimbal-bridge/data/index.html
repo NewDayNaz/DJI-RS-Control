@@ -180,14 +180,8 @@
 
   function renderCan(can) {
     if (!can) return;
-    let wiring;
-    if (can.backend === 'mcp2515') {
-      wiring = `MCP2515 CS=${can.cs_pin} INT=${can.int_pin} ${can.clock_mhz || '?'}MHz`;
-    } else if (can.tx_pin != null) {
-      wiring = `TX=GPIO${can.tx_pin} RX=GPIO${can.rx_pin}`;
-    } else {
-      wiring = can.backend || '';
-    }
+    const wiring =
+      `MCP2515 CS=${can.cs_pin} INT=${can.int_pin} ${can.clock_mhz || '?'}MHz`;
     document.getElementById('canState').textContent =
       `${can.state || '—'}  ${wiring}`;
     document.getElementById('canTx').textContent = `${can.tx_ok} / ${can.tx_fail}`;

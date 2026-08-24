@@ -1,14 +1,8 @@
 #include "can_hw.h"
 
+#include <SPI.h>
+#include <mcp2515.h>
 #include <cstring>
-
-#if !defined(CAN_BACKEND_MCP2515) && !defined(CAN_BACKEND_TWAI)
-#error "Set CAN_BACKEND_MCP2515 or CAN_BACKEND_TWAI in platformio.ini"
-#endif
-
-#if defined(CAN_BACKEND_MCP2515) && defined(CAN_BACKEND_TWAI)
-#error "Pick exactly one CAN backend"
-#endif
 
 static SemaphoreHandle_t g_lock = nullptr;
 static TaskHandle_t g_rxWaiter = nullptr;
@@ -35,11 +29,6 @@ static bool lockTake(uint32_t timeoutMs) {
 static void lockGive() {
     if (g_lock) xSemaphoreGive(g_lock);
 }
-
-#if defined(CAN_BACKEND_MCP2515)
-
-#include <SPI.h>
-#include <mcp2515.h>
 
 #ifndef MCP2515_CS_PIN
 #define MCP2515_CS_PIN D7
@@ -289,158 +278,3 @@ void canHwFillStatus(JsonObject can) {
     can["rx_missed"] = g_rxOverflow;
     can["rx_queued"] = 0;
 }
-
-#else // CAN_BACKEND_TWAI
-
-#include "driver/twai.h"
-
-#ifndef CAN_TX_GPIO_NUM
-#define CAN_TX_GPIO_NUM 6
-#endif
-#ifndef CAN_RX_GPIO_NUM
-#define CAN_RX_GPIO_NUM 7
-#endif
-
-static constexpr gpio_num_t kTxPin = (gpio_num_t) CAN_TX_GPIO_NUM;
-static constexpr gpio_num_t kRxPin = (gpio_num_t) CAN_RX_GPIO_NUM;
-
-const char *canHwBackendName() { return "twai"; }
-
-static const char *twaiStateName(twai_state_t s) {
-    switch (s) {
-        case TWAI_STATE_STOPPED: return "stopped";
-        case TWAI_STATE_RUNNING: return "running";
-        case TWAI_STATE_BUS_OFF: return "bus_off";
-        case TWAI_STATE_RECOVERING: return "recovering";
-        default: return "unknown";
-    }
-}
-
-bool canHwInit() {
-    lockCreate();
-    twai_general_config_t g_config =
-        TWAI_GENERAL_CONFIG_DEFAULT(kTxPin, kRxPin, TWAI_MODE_NORMAL);
-    g_config.rx_queue_len = 128;
-    g_config.tx_queue_len = 8;
-    g_config.alerts_enabled = TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED |
-                              TWAI_ALERT_ERR_PASS | TWAI_ALERT_ABOVE_ERR_WARN |
-                              TWAI_ALERT_RX_QUEUE_FULL;
-    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();
-    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-
-    if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
-        Serial.println("[can] TWAI driver install failed");
-        g_state = "fail_init";
-        return false;
-    }
-    if (twai_start() != ESP_OK) {
-        Serial.println("[can] TWAI start failed");
-        g_state = "fail_init";
-        return false;
-    }
-    g_started = true;
-    g_state = "running";
-    Serial.printf("[can] TWAI started at 1 Mbps  TX=GPIO%d RX=GPIO%d  filter=accept_all\n",
-                  (int) kTxPin, (int) kRxPin);
-    return true;
-}
-
-bool canHwHealthy() {
-    twai_status_info_t st = {};
-    if (twai_get_status_info(&st) != ESP_OK) return false;
-    g_state = twaiStateName(st.state);
-    return st.state == TWAI_STATE_RUNNING && st.tx_error_counter < 96;
-}
-
-bool canHwSend(uint32_t id, const uint8_t *data, uint8_t len, uint32_t timeoutMs) {
-    if (!g_started || len > 8) return false;
-    twai_message_t msg = {};
-    msg.identifier = id;
-    msg.data_length_code = len;
-    msg.extd = 0;
-    msg.rtr = 0;
-    if (len) memcpy(msg.data, data, len);
-    return twai_transmit(&msg, pdMS_TO_TICKS(timeoutMs)) == ESP_OK;
-}
-
-bool canHwReceive(CanHwFrame &out, uint32_t timeoutMs) {
-    twai_message_t rx = {};
-    if (twai_receive(&rx, pdMS_TO_TICKS(timeoutMs)) != ESP_OK) return false;
-    out.id = rx.identifier;
-    out.dlc = rx.data_length_code > 8 ? 8 : rx.data_length_code;
-    out.extd = rx.extd;
-    memset(out.data, 0, sizeof(out.data));
-    memcpy(out.data, rx.data, out.dlc);
-    return true;
-}
-
-void canHwPollHealth() {
-    uint32_t alerts = 0;
-    if (twai_read_alerts(&alerts, 0) == ESP_OK) {
-        if (alerts & TWAI_ALERT_BUS_OFF) {
-            g_busOffEvents++;
-            Serial.println("[can] BUS-OFF (no ACK). Check CTX/CRX swap, GND, 120R, "
-                           "gimbal CAN/S-BUS switch. Recovering.");
-            twai_initiate_recovery();
-        }
-        if (alerts & TWAI_ALERT_BUS_RECOVERED) {
-            if (twai_start() == ESP_OK) {
-                Serial.println("[can] recovered, TWAI restarted");
-            } else {
-                Serial.println("[can] recovered but twai_start failed");
-            }
-        }
-        if (alerts & TWAI_ALERT_ERR_PASS) {
-            Serial.println("[can] error-passive (still no ACKs)");
-        }
-        if (alerts & TWAI_ALERT_ABOVE_ERR_WARN) {
-            Serial.println("[can] error warning limit");
-        }
-        if (alerts & TWAI_ALERT_RX_QUEUE_FULL) {
-            g_rxOverflow++;
-            Serial.println("[can] RX queue full — frame dropped");
-        }
-    }
-
-    twai_status_info_t st = {};
-    if (twai_get_status_info(&st) == ESP_OK) {
-        g_state = twaiStateName(st.state);
-        if (st.state == TWAI_STATE_BUS_OFF) twai_initiate_recovery();
-    }
-
-    uint32_t now = millis();
-    if (now - g_lastLogMs < 2000) return;
-    g_lastLogMs = now;
-    if (twai_get_status_info(&st) != ESP_OK) return;
-    Serial.printf("[can] backend=twai state=%s tec=%lu rec=%lu bus_err=%lu "
-                  "bus_off_ev=%lu rx_missed=%lu qfull=%lu queued=%lu rx_gpio=%d\n",
-                  twaiStateName(st.state),
-                  (unsigned long) st.tx_error_counter,
-                  (unsigned long) st.rx_error_counter,
-                  (unsigned long) st.bus_error_count,
-                  (unsigned long) g_busOffEvents,
-                  (unsigned long) st.rx_missed_count,
-                  (unsigned long) g_rxOverflow,
-                  (unsigned long) st.msgs_to_rx,
-                  digitalRead(kRxPin));
-}
-
-void canHwFillStatus(JsonObject can) {
-    twai_status_info_t st = {};
-    twai_get_status_info(&st);
-    can["backend"] = canHwBackendName();
-    can["started"] = g_started;
-    can["state"] = twaiStateName(st.state);
-    can["tx_pin"] = (int) kTxPin;
-    can["rx_pin"] = (int) kRxPin;
-    can["rx_gpio"] = digitalRead(kRxPin);
-    can["tec"] = st.tx_error_counter;
-    can["rec"] = st.rx_error_counter;
-    can["bus_errors"] = st.bus_error_count;
-    can["bus_off_events"] = g_busOffEvents;
-    can["rx_missed"] = st.rx_missed_count;
-    can["rx_queued"] = st.msgs_to_rx;
-    can["filter"] = "accept_all";
-}
-
-#endif
