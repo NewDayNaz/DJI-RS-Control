@@ -1,0 +1,19 @@
+---
+description: Windows PlatformIO build/flash gotchas for the ESP32-C6 gimbal bridge
+alwaysApply: true
+---
+
+# Build and flash (Windows)
+
+Do this from PowerShell or cmd, never Git Bash. Cursor's shell here is Git Bash (`MSYSTEM=MINGW64`). pioarduino's `idf_tools.py` rejects that ("MSys/Mingw is not supported"), leaves a stub RISC-V toolchain, and the compile dies with `'riscv32-esp-elf-g++' is not recognized`. Unset `MSYSTEM`, `MSYS`, `MINGW_PREFIX`, `MINGW_CHOST`, `MINGW_PACKAGE_PREFIX`, `MSYSTEM_PREFIX`, `MSYSTEM_CARCH`, and `MSYSTEM_CHOST` before `pio`.
+
+Set `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8`, and `chcp 65001`. esptool v5 prints Unicode progress bars; on cp1252 PlatformIO's stdout reader crashes (`UnicodeEncodeError: 'charmap' codec can't encode`) and the flash hangs with the serial port held.
+
+Flash the CH343 UART port (VID `1A86:55D3`, last seen as COM5), not the Espressif USB-Serial-JTAG port (VID `303A:1001`, last seen as COM6). Native USB fails with `PermissionError` / "A device attached to the system is not functioning." Re-check `pio device list` if ports moved; pick CH343.
+
+```
+pio run -e esp32_c6_devkit_nx -t upload --upload-port COM5
+pio run -e esp32_c6_devkit_nx -t uploadfs --upload-port COM5
+```
+
+`uploadfs` writes LittleFS from `data/` (the web UI). Re-run it when `data/` changes, and after any partition-table change (the FS offset moves). Do not trust PlatformIO's "Flash: 98%" line; it measures the ELF, not `firmware.bin`. The C6 uses `partitions/8MB_noota.csv` (3MB app) because default.csv's 1.31MB OTA slot is smaller than the image.

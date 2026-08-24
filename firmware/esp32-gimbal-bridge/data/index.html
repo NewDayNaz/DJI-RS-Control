@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>DJI Gimbal Control</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1f232a;
+    --accent: #4da3ff;
+    --accent-dim: #2a4a6b;
+    --text: #e8eaed;
+    --text-dim: #8b929e;
+    --danger: #ff5c5c;
+    --ok: #4ade80;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overscroll-behavior: none; user-select: none;
+  }
+  body { display: flex; flex-direction: column; min-height: 100vh; padding: env(safe-area-inset-top) 12px 12px; }
+
+  header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 4px;
+  }
+  header h1 { font-size: 16px; font-weight: 600; margin: 0; }
+  #status { font-size: 12px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; }
+  #statusDot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); }
+  #statusDot.connected { background: var(--ok); }
+
+  .telemetry {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+    background: var(--panel); border-radius: 12px; padding: 10px; margin-bottom: 14px;
+  }
+  .telemetry div { text-align: center; }
+  .telemetry .label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .04em; }
+  .telemetry .value { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  .can-diag {
+    background: var(--panel); border-radius: 12px; padding: 10px 12px; margin-bottom: 14px;
+    font-size: 12px; color: var(--text-dim);
+  }
+  .can-diag .row { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+  .can-diag .hint { color: var(--text); margin-top: 6px; line-height: 1.35; }
+  .can-diag button {
+    padding: 8px 10px; font-size: 12px; margin-top: 8px; width: auto;
+  }
+
+  .main-controls {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 20px;
+  }
+
+  #joystickWrap { position: relative; width: min(70vw, 320px); height: min(70vw, 320px); }
+  #joystickBase {
+    width: 100%; height: 100%; border-radius: 50%;
+    background: radial-gradient(circle at 50% 50%, #262b33, #1a1d22);
+    border: 1px solid #333a44;
+    touch-action: none;
+  }
+  #joystickStick {
+    position: absolute; width: 34%; height: 34%; left: 33%; top: 33%;
+    border-radius: 50%; background: var(--accent);
+    box-shadow: 0 4px 14px rgba(77,163,255,.5);
+    transition: transform 0.05s linear;
+    pointer-events: none;
+  }
+  #joystickLabel {
+    position: absolute; bottom: -26px; width: 100%; text-align: center;
+    font-size: 12px; color: var(--text-dim);
+  }
+
+  .slider-row { width: min(70vw, 320px); }
+  .slider-row .label-row { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+
+  .buttons { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; width: min(70vw, 320px); }
+  button {
+    padding: 14px; border-radius: 10px; border: none;
+    background: var(--panel); color: var(--text); font-size: 14px; font-weight: 600;
+    border: 1px solid #333a44;
+  }
+  button:active { background: var(--accent-dim); }
+  button.primary { background: var(--accent); color: #0a0d12; border-color: var(--accent); }
+  button.primary:active { background: #3a8fe6; }
+
+  footer { text-align: center; font-size: 11px; color: var(--text-dim); padding: 10px 0 4px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>DJI Gimbal</h1>
+    <div id="status"><span id="statusDot"></span><span id="statusText">connecting…</span></div>
+  </header>
+
+  <div class="telemetry">
+    <div><div class="label">Yaw</div><div class="value" id="tYaw">--.-°</div></div>
+    <div><div class="label">Roll</div><div class="value" id="tRoll">--.-°</div></div>
+    <div><div class="label">Pitch</div><div class="value" id="tPitch">--.-°</div></div>
+  </div>
+
+  <div class="can-diag">
+    <div class="row"><span>CAN</span><span id="canState">…</span></div>
+    <div class="row"><span>TX ok / fail</span><span id="canTx">—</span></div>
+    <div class="row"><span>RX frames (0x222)</span><span id="canRx">—</span></div>
+    <div class="row"><span>TEC / REC</span><span id="canErr">—</span></div>
+    <div class="hint" id="canHint">checking transceiver…</div>
+    <button id="btnCanProbe">Probe bus (need a second CAN node)</button>
+  </div>
+
+  <div class="main-controls">
+    <div id="joystickWrap">
+      <div id="joystickBase">
+        <div id="joystickStick"></div>
+      </div>
+      <div id="joystickLabel">Pitch / Yaw speed</div>
+    </div>
+
+    <div class="slider-row">
+      <div class="label-row"><span>Roll speed</span><span id="rollVal">0°/s</span></div>
+      <input type="range" id="rollSlider" min="-90" max="90" value="0" step="1">
+    </div>
+
+    <div class="slider-row">
+      <div class="label-row"><span>Focus</span><span id="focusVal">0%</span></div>
+      <input type="range" id="focusSlider" min="0" max="4096" value="0" step="16">
+    </div>
+
+    <div class="buttons">
+      <button id="btnRecenter">Recenter</button>
+      <button id="btnSelfie">Selfie</button>
+      <button id="btnActiveTrack">ActiveTrack</button>
+      <button id="btnPush" class="primary">Telemetry: ON</button>
+    </div>
+  </div>
+
+  <footer>Max speed: <input type="range" id="maxSpeedSlider" min="10" max="200" value="60" step="10" style="width:80px;vertical-align:middle;"> <span id="maxSpeedVal">60</span>°/s</footer>
+
+<script>
+(() => {
+  const statusDot = document.getElementById('statusDot');
+  const statusText = document.getElementById('statusText');
+  let ws = null;
+  let wsReady = false;
+  let reconnectTimer = null;
+
+  function connect() {
+    const url = `ws://${location.host}/ws`;
+    ws = new WebSocket(url);
+    ws.onopen = () => {
+      wsReady = true;
+      statusDot.classList.add('connected');
+      statusText.textContent = 'connected';
+    };
+    ws.onclose = () => {
+      wsReady = false;
+      statusDot.classList.remove('connected');
+      statusText.textContent = 'reconnecting…';
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, 1000);
+    };
+    ws.onerror = () => ws.close();
+    ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg.type === 'telemetry') {
+          document.getElementById('tYaw').textContent = msg.yaw.toFixed(1) + '°';
+          document.getElementById('tRoll').textContent = msg.roll.toFixed(1) + '°';
+          document.getElementById('tPitch').textContent = msg.pitch.toFixed(1) + '°';
+        }
+      } catch (e) { /* ignore malformed frames */ }
+    };
+  }
+  connect();
+
+  function renderCan(can) {
+    if (!can) return;
+    let wiring;
+    if (can.backend === 'mcp2515') {
+      wiring = `MCP2515 CS=${can.cs_pin} INT=${can.int_pin} ${can.clock_mhz || '?'}MHz`;
+    } else if (can.tx_pin != null) {
+      wiring = `TX=GPIO${can.tx_pin} RX=GPIO${can.rx_pin}`;
+    } else {
+      wiring = can.backend || '';
+    }
+    document.getElementById('canState').textContent =
+      `${can.state || '—'}  ${wiring}`;
+    document.getElementById('canTx').textContent = `${can.tx_ok} / ${can.tx_fail}`;
+    document.getElementById('canRx').textContent =
+      `${can.rx} (${can.rx_222}) last ${can.last_rx_id_hex || '—'}`;
+    document.getElementById('canErr').textContent =
+      `${can.tec} / ${can.rec}  bus_err=${can.bus_errors || 0}` +
+      `  missed=${can.rx_missed || 0}` +
+      (can.filter ? `  filter=${can.filter}` : '');
+    const ids = (can.rx_ids || []).map((x) => {
+      const hex = '0x' + Number(x.id).toString(16).toUpperCase();
+      return `${hex}×${x.n}`;
+    }).join('  ');
+    const extra = ids ? `IDs: ${ids}` + (can.rx_ids_other ? ` (+${can.rx_ids_other} other)` : '') : '';
+    const data = can.last_rx_data ? `  last data ${can.last_rx_data}` : '';
+    const lastTx = can.last_tx ? `\nlast TX ${can.last_tx}` : '';
+    document.getElementById('canHint').textContent =
+      (can.hint || '') + (extra ? '\n' + extra + data : '') + lastTx;
+  }
+
+  async function pollStatus() {
+    try {
+      const r = await fetch('/api/status');
+      renderCan((await r.json()).can);
+    } catch (e) { /* board not up yet */ }
+  }
+  pollStatus();
+  setInterval(pollStatus, 1000);
+
+  document.getElementById('btnCanProbe').addEventListener('click', async () => {
+    const hint = document.getElementById('canHint');
+    hint.textContent = 'probing…';
+    try {
+      const r = await fetch('/api/can/probe', { method: 'POST' });
+      const body = await r.json();
+      renderCan(body.can);
+      hint.textContent = body.ok
+        ? 'Probe ACKed — transceiver TX path and a peer are both alive.'
+        : (body.can && body.can.hint) || 'Probe failed (no ACK).';
+    } catch (e) {
+      hint.textContent = 'probe request failed';
+    }
+  });
+
+  function send(obj) {
+    if (wsReady) ws.send(JSON.stringify(obj));
+  }
+
+  // ---- Joystick (pitch = Y axis, yaw = X axis) ----
+  const base = document.getElementById('joystickBase');
+  const stick = document.getElementById('joystickStick');
+  let dragging = false;
+  let maxSpeed = 60; // deg/s, adjustable via footer slider
+  let sendTimer = null;
+  let curYaw = 0, curPitch = 0, curRoll = 0;
+
+  document.getElementById('maxSpeedSlider').addEventListener('input', (e) => {
+    maxSpeed = parseFloat(e.target.value);
+    document.getElementById('maxSpeedVal').textContent = maxSpeed;
+  });
+
+  function setStickPosition(nx, ny) {
+    // nx, ny in [-1, 1]
+    const pct = 33 + nx * 25;
+    const pctY = 33 + ny * 25;
+    stick.style.left = pct + '%';
+    stick.style.top = pctY + '%';
+  }
+
+  function resetStick() {
+    setStickPosition(0, 0);
+  }
+
+  function startSendLoop() {
+    if (sendTimer) return;
+    sendTimer = setInterval(() => {
+      send({ cmd: 'speed', yaw: curYaw, roll: curRoll, pitch: curPitch });
+    }, 50); // 20 Hz
+  }
+
+  function stopSendLoop() {
+    clearInterval(sendTimer);
+    sendTimer = null;
+    curYaw = 0; curPitch = 0;
+    send({ cmd: 'speed', yaw: 0, roll: curRoll, pitch: 0 });
+  }
+
+  function handlePointer(clientX, clientY) {
+    const rect = base.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    let dx = (clientX - cx) / (rect.width / 2);
+    let dy = (clientY - cy) / (rect.height / 2);
+    const mag = Math.min(1, Math.hypot(dx, dy));
+    const ang = Math.atan2(dy, dx);
+    dx = Math.cos(ang) * mag;
+    dy = Math.sin(ang) * mag;
+    setStickPosition(dx, dy);
+    curYaw = dx * maxSpeed;
+    curPitch = -dy * maxSpeed; // up = positive pitch rate
+  }
+
+  base.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    base.setPointerCapture(e.pointerId);
+    handlePointer(e.clientX, e.clientY);
+    startSendLoop();
+  });
+  base.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    handlePointer(e.clientX, e.clientY);
+  });
+  function endDrag(e) {
+    if (!dragging) return;
+    dragging = false;
+    resetStick();
+    stopSendLoop();
+  }
+  base.addEventListener('pointerup', endDrag);
+  base.addEventListener('pointercancel', endDrag);
+
+  // ---- Roll slider (sends its own speed updates while non-zero) ----
+  const rollSlider = document.getElementById('rollSlider');
+  const rollVal = document.getElementById('rollVal');
+  let rollActive = false;
+  rollSlider.addEventListener('input', () => {
+    curRoll = parseFloat(rollSlider.value);
+    rollVal.textContent = curRoll + '°/s';
+    if (curRoll !== 0 && !sendTimer) startSendLoop();
+  });
+  rollSlider.addEventListener('change', () => {
+    if (curRoll === 0 && !dragging) {
+      rollSlider.value = 0;
+      stopSendLoop();
+    }
+  });
+
+  // ---- Focus slider ----
+  const focusSlider = document.getElementById('focusSlider');
+  const focusVal = document.getElementById('focusVal');
+  let focusDebounce = null;
+  focusSlider.addEventListener('input', () => {
+    const pos = parseInt(focusSlider.value, 10);
+    focusVal.textContent = Math.round(pos / 4096 * 100) + '%';
+    clearTimeout(focusDebounce);
+    focusDebounce = setTimeout(() => send({ cmd: 'focus', position: pos }), 40);
+  });
+
+  // ---- Buttons ----
+  document.getElementById('btnRecenter').addEventListener('click', () => send({ cmd: 'recenter' }));
+  document.getElementById('btnSelfie').addEventListener('click', () => send({ cmd: 'selfie' }));
+  document.getElementById('btnActiveTrack').addEventListener('click', () => send({ cmd: 'activetrack' }));
+
+  let pushOn = true;
+  const btnPush = document.getElementById('btnPush');
+  btnPush.addEventListener('click', () => {
+    pushOn = !pushOn;
+    send({ cmd: 'push', enable: pushOn });
+    btnPush.textContent = 'Telemetry: ' + (pushOn ? 'ON' : 'OFF');
+    btnPush.classList.toggle('primary', pushOn);
+  });
+})();
+</script>
+</body>
+</html>
