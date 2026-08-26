@@ -6,6 +6,7 @@ This document describes the DJI R SDK external protocol as used by `dji_gimbal_c
 - **Bitrate**: `1_000_000` bps (1 Mbps)
 - **SOF (start-of-frame)**: `0xAA`
 - **Command set (gimbal)**: `0x0E`
+- **Command set (camera record / focus-center)**: `0x0D`
 - **CAN IDs**:
   - Host → gimbal: `0x223`
   - Gimbal → host: `0x222`
@@ -43,7 +44,7 @@ Byte 4      : ENC              (encryption flag; 0x00 = none)
 Bytes 5–7   : RES              (3 bytes reserved; all 0x00)
 Bytes 8–9   : SEQ              (sequence number, little-endian)
 Bytes 10–11 : CRC16            (CRC-16 over bytes 0–9, little-endian)
-Byte 12     : CMD_SET          (command set; 0x0E for gimbal)
+Byte 12     : CMD_SET          (command set; 0x0E gimbal, 0x0D camera)
 Byte 13     : CMD_ID           (command ID within set)
 Bytes 14..N-5 : DATA           (command-specific payload)
 Bytes N-4..N-1 : CRC32         (CRC-32 over bytes 0..N-5, little-endian)
@@ -239,9 +240,11 @@ Most of the CLI commands treat `ret_code == 0x00` as success and display additio
 
 ## 6. Gimbal Command Set 0x0E
 
-All gimbal-related commands in the CLI use:
+Gimbal motion, telemetry, and sleep/wake in the CLI use:
 
 - `CMD_SET = 0x0E`
+
+Camera record and Ronin focus-center use `CMD_SET = 0x0D` (section 21). Those are a different command set, not extra `0x0E` cmd_ids.
 
 The sections below document each observed command (CMD_ID) and payload.
 
@@ -258,10 +261,12 @@ The sections below document each observed command (CMD_ID) and payload.
 |  0x0E   | 0x08   | gimbal → host   | Gimbal parameter push (angles)      |
 |  0x0E   | 0x09   | host ↔ gimbal   | Obtain module version               |
 |  0x0E   | 0x0B   | host ↔ gimbal   | Obtain gimbal user parameters       |
+|  0x0E   | 0x0C   | host ↔ gimbal   | Sleep / wake                        |
 |  0x0E   | 0x0E   | host ↔ gimbal   | Recenter / Selfie                   |
 |  0x0E   | 0x10   | gimbal → host   | Auto-calibration status push        |
 |  0x0E   | 0x11   | host ↔ gimbal   | ActiveTrack toggle                  |
 |  0x0E   | 0x12   | host ↔ gimbal   | Focus motor control / query         |
+|  0x0D   | 0x00   | host → camera   | Record / focus-center (section 21)  |
 
 The following subsections describe the payloads and expected replies.
 
@@ -615,14 +620,48 @@ Future work could decode individual user parameters based on further firmware an
 
 ---
 
-## 17. Recenter / Selfie – CMD_ID 0x0E
+## 17. Sleep / Wake – CMD_ID 0x0C
+
+**Purpose**: Put the gimbal to sleep or wake it.
+
+- **Command set**: `0x0E`
+- **Command ID**: `0x0C`
+
+This is not recenter. Recenter is `CMD_SET = 0x0E`, `CMD_ID = 0x0E`, payload `FE 01` (section 18). Sleep and wake share `CMD_ID = 0x0C`. The last payload byte is the switch.
+
+### 17.1 Request Payload
+
+Three bytes. Total SDK packet length is 21.
+
+```text
+0x23  uint8  # constant
+0x01  uint8  # constant
+mode  uint8
+    0x01 → sleep  (CLI: sleep)
+    0x00 → wake   (CLI: wake)
+```
+
+CLI builders:
+
+- `build_sleep()` → `0x0E / 0x0C / 23 01 01`
+- `build_wake()`  → `0x0E / 0x0C / 23 01 00`
+
+### 17.2 Reply
+
+- Reply command: `CMD_SET = 0x0E`, `CMD_ID = 0x0C`.
+- The CLI prints `cmd_set`, `cmd_id`, `ret_code`, and payload hex from the `0x222` reply.
+- These commands execute if the gimbal accepts them. Use `sleep` only when you mean to sleep the unit.
+
+---
+
+## 18. Recenter / Selfie – CMD_ID 0x0E
 
 **Purpose**: Trigger a recenter or selfie operation.
 
 - **Command set**: `0x0E`
 - **Command ID**: `0x0E`
 
-### 17.1 Request Payload
+### 18.1 Request Payload
 
 Two bytes:
 
@@ -633,22 +672,24 @@ mode uint8
     0x02 → Selfie once
 ```
 
-### 17.2 Reply
+### 18.2 Reply
 
 - Reply command: `CMD_SET = 0x0E`, `CMD_ID = 0x0E`.
 - `ret_code == 0x00` → success.
 - The CLI also treats a missing reply as "command may still have executed" based on empirical behavior.
 
+Do not confuse this with sleep/wake (`CMD_ID = 0x0C`, payload `23 01 xx`).
+
 ---
 
-## 18. ActiveTrack Toggle – CMD_ID 0x11
+## 19. ActiveTrack Toggle – CMD_ID 0x11
 
 **Purpose**: Toggle ActiveTrack on/off.
 
 - **Command set**: `0x0E`
 - **Command ID**: `0x11`
 
-### 18.1 Request Payload
+### 19.1 Request Payload
 
 Single byte:
 
@@ -656,16 +697,18 @@ Single byte:
 0x03  uint8  # toggle ActiveTrack start/stop
 ```
 
-### 18.2 Reply
+### 19.2 Reply
 
 - Reply command: `CMD_SET = 0x0E`, `CMD_ID = 0x11`.
 - `ret_code == 0x00` → ActiveTrack toggled successfully.
 
 ---
 
-## 19. Focus Motor Control and Query – CMD_ID 0x12
+## 20. Focus Motor Control and Query – CMD_ID 0x12
 
 **Purpose**: Control and query the external focus motor.
+
+This is the follow-focus motor (`CMD_ID = 0x12`). Ronin camera focus-center is `CMD_SET = 0x0D` (section 21).
 
 - **Command set**: `0x0E`
 - **Command ID**: `0x12`
@@ -675,7 +718,7 @@ There are at least two sub-operations:
 1. Set focus position (`focus-set`).
 2. Get focus position (`focus-get`).
 
-### 19.1 Set Focus Position (`focus-set`)
+### 20.1 Set Focus Position (`focus-set`)
 
 **Request payload**:
 
@@ -712,7 +755,7 @@ focus_pos = struct.unpack_from("<I", data, len(data) - 4)[0]
 
 Values are typically in the range `0–4096`.
 
-### 19.2 Get Focus Position (`focus-get`)
+### 20.2 Get Focus Position (`focus-get`)
 
 **Request payload**:
 
@@ -737,11 +780,51 @@ If decoding fails, the CLI falls back to printing:
 
 ---
 
-## 20. High-Level Interaction Patterns
+## 21. Camera Command Set 0x0D
+
+**Purpose**: Trigger camera record and Ronin focus-center. These are not gimbal `0x0E` commands.
+
+- **Command set**: `0x0D`
+- **Command ID**: `0x00` for the four CLI commands below
+
+| CLI | DATA |
+|-----|------|
+| `rec-start` | `03 00` |
+| `rec-stop` | `04 00` |
+| `focus-center-start` | `05 00` |
+| `focus-center-stop` | `0B 00` |
+
+Total SDK packet length is 20 (2-byte payload).
+
+### 21.1 Request Payload
+
+```text
+op    uint8
+0x00  uint8  # constant
+```
+
+`op` values:
+
+- `0x03` record start
+- `0x04` record stop
+- `0x05` focus-center start
+- `0x0B` focus-center stop
+
+CLI builders: `build_record_start()`, `build_record_stop()`, `build_focus_center_start()`, `build_focus_center_stop()`.
+
+### 21.2 Reply
+
+- Reply command: `CMD_SET = 0x0D`, `CMD_ID = 0x00`.
+- The CLI prints `cmd_set`, `cmd_id`, `ret_code`, and payload hex from the `0x222` reply.
+- These commands execute if accepted. `rec-start` starts recording on a connected camera.
+
+---
+
+## 22. High-Level Interaction Patterns
 
 The CLI (`dji_gimbal_cli.py`) demonstrates several typical flows:
 
-### 20.1 Continuous Angle Streaming
+### 22.1 Continuous Angle Streaming
 
 - `angle`:
   - Repeatedly sends `CMD_SET = 0x0E`, `CMD_ID = 0x02`, `DATA = [0x01]` (attitude angles).
@@ -749,7 +832,7 @@ The CLI (`dji_gimbal_cli.py`) demonstrates several typical flows:
 - `joint`:
   - Same, but `DATA = [0x02]` (joint angles).
 
-### 20.2 One-Shot Info Query
+### 22.2 One-Shot Info Query
 
 The `info` command performs a sequence:
 
@@ -760,7 +843,7 @@ The `info` command performs a sequence:
 
 All results are printed in a human-readable format for quick diagnostics.
 
-### 20.3 Push-Based Telemetry
+### 22.3 Push-Based Telemetry
 
 - `push-on`:
   - Sends `CMD_SET = 0x0E`, `CMD_ID = 0x07`, `DATA = [0x01]`.
@@ -773,9 +856,31 @@ All results are printed in a human-readable format for quick diagnostics.
     - `CMD_ID = 0x08`: gimbal parameter push (angles).
     - `CMD_ID = 0x10`: auto-calibration status.
 
+### 22.4 Sleep, wake, record, and focus-center
+
+These one-shot commands print the TX encoding, then the `0x222` reply as `cmd_set`, `cmd_id`, `ret_code`, and payload hex. They execute if the gimbal accepts them.
+
+```text
+python dji_gimbal_cli.py COM6 -c sleep
+python dji_gimbal_cli.py COM6 -c wake
+python dji_gimbal_cli.py COM6 -c rec-start
+python dji_gimbal_cli.py COM6 -c rec-stop
+python dji_gimbal_cli.py COM6 -c focus-center-start
+python dji_gimbal_cli.py COM6 -c focus-center-stop
+```
+
+| CLI | CMD_SET | CMD_ID | DATA |
+|-----|---------|--------|------|
+| `sleep` | `0x0E` | `0x0C` | `23 01 01` |
+| `wake` | `0x0E` | `0x0C` | `23 01 00` |
+| `rec-start` | `0x0D` | `0x00` | `03 00` |
+| `rec-stop` | `0x0D` | `0x00` | `04 00` |
+| `focus-center-start` | `0x0D` | `0x00` | `05 00` |
+| `focus-center-stop` | `0x0D` | `0x00` | `0B 00` |
+
 ---
 
-## 21. Implementing a Custom Client
+## 23. Implementing a Custom Client
 
 To implement your own client in another language or environment:
 
@@ -799,7 +904,7 @@ To implement your own client in another language or environment:
      - Validate CRC-16 and CRC-32.
    - Treat packets with `(byte3 & 0x20) != 0` as replies or pushes.
 5. **Decode commands**:
-   - Use `CMD_SET = 0x0E` and `CMD_ID` as documented above.
+   - Use `CMD_SET` and `CMD_ID` as documented above (`0x0E` gimbal, `0x0D` camera).
    - Parse payloads according to the sections in this document.
 6. **Handle return codes**:
    - Use `ret_code` to classify success vs. parse/execute/undefined errors.

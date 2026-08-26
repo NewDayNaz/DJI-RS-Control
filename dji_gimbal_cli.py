@@ -3,14 +3,18 @@
 DJI gimbal/CAN console
 
 Uses the DJI R SDK external protocol (SOF 0xAA, CAN 0x223 Tx / 0x222 Rx, 1 Mbps).
-Implements gimbal CmdSet 0x0E: obtain angle, position, speed, limits (obtain), stiffness/user params (obtain),
-parameter push, recenter/selfie, ActiveTrack; handles push (0x08, 0x10) during recv.
+See docs/DJI_R_SDK_Protocol.md for packet layouts.
+Implements gimbal CmdSet 0x0E (angle, position, speed, limits, stiffness, user params,
+parameter push, sleep/wake 0x0C, recenter/selfie, ActiveTrack, focus motor) and camera
+CmdSet 0x0D (record, focus-center). Handles push (0x08, 0x10) during recv.
 
   python dji_gimbal_cli.py COM6                        # stream attitude (default)
   python dji_gimbal_cli.py COM6 -c version             # module version
   python dji_gimbal_cli.py COM6 -c position 0 0 -90    # set position (yaw roll pitch °)
   python dji_gimbal_cli.py COM6 -c speed 10 0 -5       # set speed (yaw roll pitch °/s)
   python dji_gimbal_cli.py COM6 -c recenter            # recenter gimbal
+  python dji_gimbal_cli.py COM6 -c sleep               # sleep (0x0E/0x0C 23 01 01)
+  python dji_gimbal_cli.py COM6 -c rec-start            # camera record start (0x0D/0x00 03 00)
   python dji_gimbal_cli.py COM6 -c listen               # enable push and print pushes
 
 Requires: python-can, pyserial
@@ -25,6 +29,7 @@ import argparse
 import struct
 import sys
 import time
+from collections.abc import Callable
 
 # CRC-16: poly 0x8005, init 0x3aa3 (reflected), ref in/out. Matches repo custom_crc16.
 CRC16_TABLE = (
@@ -208,6 +213,49 @@ def build_activetrack_toggle() -> bytes:
     return build_sdk_packet(0x0E, 0x11, bytes([0x03]))
 
 
+# Sleep/wake: gimbal cmd_set 0x0E cmd_id 0x0C (not recenter 0x0E/FE 01).
+# Record and focus-center: camera cmd_set 0x0D cmd_id 0x00.
+
+def build_sleep() -> bytes:
+    """Sleep gimbal (CmdSet 0x0E, CmdID 0x0C, data 23 01 01)."""
+    return build_sdk_packet(0x0E, 0x0C, bytes([0x23, 0x01, 0x01]))
+
+
+def build_wake() -> bytes:
+    """Wake gimbal (CmdSet 0x0E, CmdID 0x0C, data 23 01 00)."""
+    return build_sdk_packet(0x0E, 0x0C, bytes([0x23, 0x01, 0x00]))
+
+
+def build_record_start() -> bytes:
+    """Camera record start (CmdSet 0x0D, CmdID 0x00, data 03 00)."""
+    return build_sdk_packet(0x0D, 0x00, bytes([0x03, 0x00]))
+
+
+def build_record_stop() -> bytes:
+    """Camera record stop (CmdSet 0x0D, CmdID 0x00, data 04 00)."""
+    return build_sdk_packet(0x0D, 0x00, bytes([0x04, 0x00]))
+
+
+def build_focus_center_start() -> bytes:
+    """Focus center start (CmdSet 0x0D, CmdID 0x00, data 05 00)."""
+    return build_sdk_packet(0x0D, 0x00, bytes([0x05, 0x00]))
+
+
+def build_focus_center_stop() -> bytes:
+    """Focus center stop (CmdSet 0x0D, CmdID 0x00, data 0B 00)."""
+    return build_sdk_packet(0x0D, 0x00, bytes([0x0B, 0x00]))
+
+
+PROBE_COMMANDS: dict[str, tuple[str, Callable[[], bytes]]] = {
+    "sleep": ("Sleep gimbal", build_sleep),
+    "wake": ("Wake gimbal", build_wake),
+    "rec-start": ("Camera record start", build_record_start),
+    "rec-stop": ("Camera record stop", build_record_stop),
+    "focus-center-start": ("Focus center start", build_focus_center_start),
+    "focus-center-stop": ("Focus center stop", build_focus_center_stop),
+}
+
+
 def build_control_position(
     yaw_deg: float,
     roll_deg: float,
@@ -297,6 +345,24 @@ RET_CODE_NAMES: dict[int, str] = {
 def return_code_str(code: int) -> str:
     """Human-readable return code for device replies."""
     return RET_CODE_NAMES.get(code, "0x{:02X}".format(code))
+
+
+def print_sdk_reply(reply: bytes | None) -> None:
+    """Print cmd_set, cmd_id, ret_code, and payload hex from a 0x222 SDK reply."""
+    if reply is None:
+        print("No reply on 0x222.")
+        return
+    parsed = validate_sdk_reply(reply)
+    if parsed is None:
+        print("Reply failed validation.")
+        return
+    cmd_set, cmd_id, ret_code, data = parsed
+    payload = data.hex() if data else "(empty)"
+    print(
+        "reply  cmd_set=0x{:02X}  cmd_id=0x{:02X}  ret=0x{:02X} ({})  payload_len={}  hex={}".format(
+            cmd_set, cmd_id, ret_code, return_code_str(ret_code), len(data), payload
+        )
+    )
 
 
 def validate_sdk_reply(packet: bytes) -> tuple[int, int, int, bytes] | None:
@@ -892,10 +958,25 @@ def run(
             else:
                 print("No focus reply.")
 
+        elif command in PROBE_COMMANDS:
+            label, builder = PROBE_COMMANDS[command]
+            pkt = builder()
+            cmd_set, cmd_id = pkt[12], pkt[13]
+            payload = pkt[14:-4]
+            print(
+                "{}  cmd_set=0x{:02X}  cmd_id=0x{:02X}  payload={}".format(
+                    label, cmd_set, cmd_id, payload.hex()
+                )
+            )
+            print("This command executes if the gimbal accepts it.")
+            reply = request_reply(pkt, cmd_set, cmd_id, timeout=1.0)
+            print_sdk_reply(reply)
+
         else:
             print("Unknown command: {}".format(command))
             print("Use: angle, joint, version, limit, stiffness, user-params, recenter, selfie, activetrack,")
-            print("     push-on, push-off, position, speed, listen, info, focus-set, focus-get")
+            print("     push-on, push-off, position, speed, listen, info, focus-set, focus-get,")
+            print("     sleep, wake, rec-start, rec-stop, focus-center-start, focus-center-stop")
     except KeyboardInterrupt:
         pass
     finally:
@@ -904,7 +985,7 @@ def run(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="DJI gimbal/CAN console via SH-C31G (Canable 2.0). Commands: angle, position, speed, limit, stiffness, user-params, recenter, selfie, activetrack, push-on/off, listen, info.",
+        description="DJI gimbal/CAN console via SH-C31G (Canable 2.0). Commands: angle, position, speed, limit, stiffness, user-params, recenter, selfie, activetrack, sleep, wake, rec-start/stop, focus-center-start/stop, push-on/off, listen, info.",
     )
     parser.add_argument(
         "channel",
@@ -919,11 +1000,13 @@ def main() -> int:
             "angle", "joint", "version", "limit", "stiffness", "user-params",
             "recenter", "selfie", "activetrack", "push-on", "push-off",
             "position", "speed", "listen", "info", "focus-set", "focus-get",
+            *PROBE_COMMANDS,
         ],
         help=(
             "Command. For position pass extra args (e.g. -c position 0 0 -90). "
             "For speed pass yaw roll pitch deg/s (e.g. -c speed 10 0 -5). "
             "For focus-set pass focus position 0–4096 (e.g. -c focus-set 2048). "
+            "sleep/wake/rec-*/focus-center-* execute if accepted; replies print cmd_set/cmd_id/ret/hex. "
             "Default: angle"
         ),
     )
