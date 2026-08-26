@@ -5,8 +5,8 @@ DJI gimbal/CAN console
 Uses the DJI R SDK external protocol (SOF 0xAA, CAN 0x223 Tx / 0x222 Rx, 1 Mbps).
 See docs/DJI_R_SDK_Protocol.md for packet layouts.
 Implements gimbal CmdSet 0x0E (angle, position, speed, limits, stiffness, user params,
-parameter push, sleep/wake 0x0C, recenter/selfie, ActiveTrack, focus motor) and camera
-CmdSet 0x0D (record, focus-center). Handles push (0x08, 0x10) during recv.
+parameter push, sleep/wake 0x0C, recenter/selfie, AutoTune 0x0F, ActiveTrack, focus motor)
+and camera CmdSet 0x0D (record, focus-center, cmd 0x01). Handles push (0x08, 0x10) during recv.
 
   python dji_gimbal_cli.py COM6                        # stream attitude (default)
   python dji_gimbal_cli.py COM6 -c version             # module version
@@ -14,6 +14,8 @@ CmdSet 0x0D (record, focus-center). Handles push (0x08, 0x10) during recv.
   python dji_gimbal_cli.py COM6 -c speed 10 0 -5       # set speed (yaw roll pitch °/s)
   python dji_gimbal_cli.py COM6 -c recenter            # recenter gimbal
   python dji_gimbal_cli.py COM6 -c sleep               # sleep (0x0E/0x0C 23 01 01)
+  python dji_gimbal_cli.py COM6 -c calibrate            # AutoTune gimbal motors (0x0E/0x0F 00 01 01)
+  python dji_gimbal_cli.py COM6 -c motor-calib          # focus-motor autocal (0x0E/0x12 02 00 01)
   python dji_gimbal_cli.py COM6 -c rec-start            # camera record start (0x0D/0x00 03 00)
   python dji_gimbal_cli.py COM6 -c listen               # enable push and print pushes
 
@@ -183,9 +185,13 @@ def build_obtain_module_version(device_id: int = 0x00000001) -> bytes:
     return build_sdk_packet(0x0E, 0x09, struct.pack("<I", device_id & 0xFFFFFFFF))
 
 
-def build_obtain_gimbal_limit_angle() -> bytes:
-    """Build Obtain gimbal limit angle (CmdSet 0x0E, CmdID 0x04)."""
-    return build_sdk_packet(0x0E, 0x04, b"")
+def build_obtain_gimbal_limit_angle(query: int = 0x01) -> bytes:
+    """Build Obtain gimbal limit angle (CmdSet 0x0E, CmdID 0x04).
+
+    A working CAN client sends DATA 01. Empty DATA is also accepted by some
+    devices; the 13-byte reply prefix matches this query byte when present.
+    """
+    return build_sdk_packet(0x0E, 0x04, bytes([query & 0xFF]))
 
 
 def build_obtain_motor_stiffness() -> bytes:
@@ -194,8 +200,16 @@ def build_obtain_motor_stiffness() -> bytes:
 
 
 def build_obtain_gimbal_user_params() -> bytes:
-    """Build Obtain gimbal user parameters (CmdSet 0x0E, CmdID 0x0B)."""
+    """Build Obtain gimbal user parameters (CmdSet 0x0E, CmdID 0x0B). Empty DATA, reply required."""
     return build_sdk_packet(0x0E, 0x0B, b"")
+
+
+def build_obtain_gimbal_user_params_poll() -> bytes:
+    """Periodic user-params poll used by a working CAN client (CmdSet 0x0E, CmdID 0x0B).
+
+    CMD_TYPE 0x02 (not reply-required) and DATA 00 22 23.
+    """
+    return build_sdk_packet(0x0E, 0x0B, bytes([0x00, 0x22, 0x23]), cmd_type=0x02)
 
 
 def build_set_parameter_push(enable: bool) -> bytes:
@@ -246,13 +260,39 @@ def build_focus_center_stop() -> bytes:
     return build_sdk_packet(0x0D, 0x00, bytes([0x0B, 0x00]))
 
 
+def build_calibrate() -> bytes:
+    """AutoTune: retune gimbal motors for the current payload (CmdSet 0x0E, CmdID 0x0F, data 00 01 01)."""
+    return build_sdk_packet(0x0E, 0x0F, bytes([0x00, 0x01, 0x01]))
+
+
+def build_camera_cmd() -> bytes:
+    """Camera CmdSet 0x0D CmdID 0x01, data 01. Query sent next to record-start; reply byte 0x02 is latched by a working client."""
+    return build_sdk_packet(0x0D, 0x01, bytes([0x01]))
+
+
+def build_motor_calib() -> bytes:
+    """Focus-motor autocalibration (CmdSet 0x0E, CmdID 0x12, data 02 00 01). Finds lens endpoints; required before zoom/focus-set."""
+    return build_sdk_packet(0x0E, 0x12, bytes([0x02, 0x00, 0x01]))
+
+
 PROBE_COMMANDS: dict[str, tuple[str, Callable[[], bytes]]] = {
     "sleep": ("Sleep gimbal", build_sleep),
     "wake": ("Wake gimbal", build_wake),
-    "rec-start": ("Camera record start", build_record_start),
+    "calibrate": ("AutoTune gimbal motors", build_calibrate),
+    "rec-start": ("Camera record start (via gimbal camera-control cable)", build_record_start),
     "rec-stop": ("Camera record stop", build_record_stop),
-    "focus-center-start": ("Focus center start", build_focus_center_start),
-    "focus-center-stop": ("Focus center stop", build_focus_center_stop),
+    "focus-center-start": ("Camera center-focus start", build_focus_center_start),
+    "focus-center-stop": ("Camera center-focus stop", build_focus_center_stop),
+    "cam-cmd": ("Camera 0x0D/0x01 query (data 01)", build_camera_cmd),
+    "motor-calib": ("Focus-motor autocalibrate (lens endpoints)", build_motor_calib),
+    "user-params-poll": ("User-params poll (type 0x02, data 00 22 23)", build_obtain_gimbal_user_params_poll),
+}
+
+# Names that map onto an existing -c command.
+COMMAND_ALIASES: dict[str, str] = {
+    "autotune": "calibrate",
+    "focus-02": "motor-calib",
+    "zoom-set": "focus-set",
 }
 
 
@@ -282,16 +322,21 @@ def build_control_position(
     return build_sdk_packet(0x0E, 0x00, struct.pack("<3hBB", yaw, roll, pitch, ctrl, time_byte))
 
 
+# Bit 7 set. A working CAN client leaves this at 0x80; older notes used 0x88.
+SPEED_CTRL_TAKEOVER = 0x80
+
+
 def build_control_speed(
     yaw_degs: float,
     roll_degs: float,
-    pitch_degs: float
+    pitch_degs: float,
+    ctrl: int = SPEED_CTRL_TAKEOVER,
 ) -> bytes:
-    """Build Handheld Gimbal Speed Control (CmdSet 0x0E, CmdID 0x01). Rates in deg/s; stored as 0.1 deg/s (int16, range -3600 to +3600). ctrl_byte 0x88 = take over speed control."""
+    """Build Handheld Gimbal Speed Control (CmdSet 0x0E, CmdID 0x01). Rates in deg/s; stored as 0.1 deg/s (int16, range -3600 to +3600)."""
     yaw_x10 = max(-3600, min(3600, int(round(yaw_degs * 10))))
     roll_x10 = max(-3600, min(3600, int(round(roll_degs * 10))))
     pitch_x10 = max(-3600, min(3600, int(round(pitch_degs * 10))))
-    return build_sdk_packet(0x0E, 0x01, struct.pack("<3hB", yaw_x10, roll_x10, pitch_x10, 0x88))
+    return build_sdk_packet(0x0E, 0x01, struct.pack("<3hB", yaw_x10, roll_x10, pitch_x10, ctrl & 0xFF))
 
 
 def build_focus_set(
@@ -303,11 +348,11 @@ def build_focus_set(
     """
     Build focus motor control command (CmdSet 0x0E, CmdID 0x12).
 
-    Payload layout (from firmware analysis / reference controller):
+    Payload layout:
       - cmd_sub_id: 0x01
       - ctl_type:   0x00
       - data_len:   0x02 (bytes)
-      - position:   uint16, range 0–4096 (absolute focus position)
+      - position:   uint16, 0–4096 after motor-calib (wide to tight when the motor drives zoom)
     """
     pos_clamped = max(0, min(0xFFFF, int(position)))
     payload = struct.pack("<3BH", cmd_sub_id & 0xFF, ctl_type & 0xFF, data_length & 0xFF, pos_clamped)
@@ -363,12 +408,15 @@ def print_sdk_reply(reply: bytes | None) -> None:
             cmd_set, cmd_id, ret_code, return_code_str(ret_code), len(data), payload
         )
     )
+    if cmd_set == 0x0D and cmd_id == 0x01 and data:
+        print("  cam-cmd first payload byte=0x{:02X} (0x02 is the value a working client latches)".format(data[0]))
 
 
 def validate_sdk_reply(packet: bytes) -> tuple[int, int, int, bytes] | None:
     """
     Validate SDK reply packet and return (cmd_set, cmd_id, return_code, data) or None.
-    data is the reply payload starting at byte 14 (return_code is at 14, rest follows).
+    return_code is byte 14; data is bytes 15 through the byte before CRC-32.
+    Unsolicited push (0x08) uses byte 14 as flags, not a DJI return code.
     """
     if len(packet) < 16:
         return None
@@ -443,7 +491,7 @@ def parse_module_version_reply(packet: bytes) -> tuple[int, int, tuple[int, int,
     return (device_id, ver, v)
 
 
-def parse_limit_angle_reply(packet: bytes) -> dict[str, float] | None:
+def parse_limit_angle_reply(packet: bytes) -> dict[str, float | str | int] | None:
     """Parse reply to Obtain gimbal limit angle (0x0E, 0x04). Returns dict with yaw/roll/pitch min/max or None."""
     r = validate_sdk_reply(packet)
     if r is None:
@@ -453,7 +501,8 @@ def parse_limit_angle_reply(packet: bytes) -> dict[str, float] | None:
         return None
     if ret_code != RET_SUCCESS:
         return None
-    # Payload: either 6 x int16 (12 bytes) or 1 byte prefix + 6 x int16 (13 bytes). Units 0.1°.
+    # Payload: 6 x int16 (12 bytes), or 1-byte prefix + 6 x int16 (13 bytes). Units 0.1°.
+    # Prefer the prefixed layout when length is 13 so the query byte is not read as yaw_min.
     def parse_6_int16(d: bytes, offset: int) -> dict[str, float] | None:
         if offset + 12 > len(d):
             return None
@@ -469,14 +518,15 @@ def parse_limit_angle_reply(packet: bytes) -> dict[str, float] | None:
         except Exception:
             return None
 
-    if len(data) >= 12:
-        res = parse_6_int16(data, 0)
-        if res is not None:
-            return res
-    if len(data) >= 13:
+    if len(data) == 13:
         res = parse_6_int16(data, 1)
         if res is not None:
+            res["prefix"] = data[0]
             return res
+    if len(data) >= 12:
+        return parse_6_int16(data, 0)
+    if len(data) == 6:
+        return {"compact_hex": data.hex(), "raw_len": 6}
     return None
 
 
@@ -489,6 +539,15 @@ def limit_angle_reply_raw(packet: bytes) -> tuple[int, bytes] | None:
     if cmd_set != 0x0E or cmd_id != 0x04:
         return None
     return (ret_code, data)
+
+
+def print_limit_result(res: dict) -> None:
+    if "compact_hex" in res:
+        print("compact 6-byte payload {}".format(res["compact_hex"]))
+        return
+    print("yaw   [{:7.1f}°, {:7.1f}°]  roll [{:7.1f}°, {:7.1f}°]  pitch [{:7.1f}°, {:7.1f}°]".format(
+        res["yaw_min"], res["yaw_max"], res["roll_min"], res["roll_max"],
+        res["pitch_min"], res["pitch_max"]))
 
 
 def parse_motor_stiffness_reply(packet: bytes) -> dict[str, int | str] | None:
@@ -513,33 +572,62 @@ def parse_user_params_reply(packet: bytes) -> dict[str, int | str] | None:
     return {"ret_code": ret_code, "raw_len": len(data), "hex": data.hex()}
 
 
+def _angles_from_int16s(blob: bytes, offset: int) -> tuple[float, float, float] | None:
+    if offset + 6 > len(blob):
+        return None
+    yaw = struct.unpack_from("<h", blob, offset)[0] * 0.1
+    roll = struct.unpack_from("<h", blob, offset + 2)[0] * 0.1
+    pitch = struct.unpack_from("<h", blob, offset + 4)[0] * 0.1
+    return (yaw, roll, pitch)
+
+
 def try_handle_push(packet: bytes) -> bool:
     """
-    If packet is a gimbal push (CmdSet 0x0E, CmdID 0x08 or 0x10), print it and return True.
-    Otherwise return False. Used in receive loop so pushes are displayed during streaming.
+    If packet is a gimbal push (CmdSet 0x0E, CmdID 0x08 or 0x10) or a camera 0x0D/0x01
+    reply, print it and return True. Otherwise return False.
     """
     r = validate_sdk_reply(packet)
     if r is None:
         return False
     cmd_set, cmd_id, ret_code, data = r
+    if cmd_set == 0x0D and cmd_id == 0x01:
+        first = data[0] if data else None
+        print(
+            "[cam] 0x0D/0x01 ret=0x{:02X} first=0x{:02X} len={} hex={}".format(
+                ret_code, first if first is not None else 0, len(data), data.hex()
+            )
+        )
+        return True
     if cmd_set != 0x0E:
         return False
     if cmd_id == 0x08:
-        # Push gimbal parameters
-        if len(data) >= 7:
-            try:
-                # Same layout as angle reply: data_type(1), yaw(2), roll(2), pitch(2)
-                yaw = struct.unpack_from("<h", data, 1)[0] * 0.1
-                roll = struct.unpack_from("<h", data, 3)[0] * 0.1
-                pitch = struct.unpack_from("<h", data, 5)[0] * 0.1
-                print("[push] gimbal params: yaw={:.1f}° roll={:.1f}° pitch={:.1f}°".format(yaw, roll, pitch))
-            except Exception:
-                print("[push] gimbal params (0x08): len={} hex={}".format(len(data), data.hex()))
+        # Byte 14 is flags on unsolicited push (bit 0 = angles present), then 3 x int16.
+        # Some 26-byte replies use the angle-reply layout (data_type + 3 x int16) after ret_code.
+        angles = None
+        layout = ""
+        if (ret_code & 0x01) and len(data) >= 6:
+            angles = _angles_from_int16s(data, 0)
+            layout = "flags=0x{:02X}".format(ret_code)
+        if angles is None and len(data) >= 7:
+            angles = _angles_from_int16s(data, 1)
+            layout = "data_type=0x{:02X}".format(data[0])
+        if angles is not None:
+            yaw, roll, pitch = angles
+            extra = ""
+            rest = data[6:] if (ret_code & 0x01) else data[7:]
+            if rest:
+                extra = " extra={}".format(rest.hex())
+            print(
+                "[push] gimbal params: yaw={:.1f}° roll={:.1f}° pitch={:.1f}° {}{}".format(
+                    yaw, roll, pitch, layout, extra
+                )
+            )
         else:
-            print("[push] gimbal params (0x08): len={} hex={}".format(len(data), data.hex()))
+            print("[push] gimbal params (0x08): flags=0x{:02X} len={} hex={}".format(
+                ret_code, len(data), data.hex()
+            ))
         return True
     if cmd_id == 0x10:
-        # Auto calibration status push
         print("[push] auto calibration status (0x10): ret=0x{:02X} len={} hex={}".format(ret_code, len(data), data.hex()))
         return True
     return False
@@ -649,6 +737,7 @@ def run(
         return _receive_reply(bus, reassemble, timeout, expect_cmd_set=expect_set, expect_cmd_id=expect_id, debug=debug)
 
     extra = extra or []
+    command = COMMAND_ALIASES.get(command, command)
 
     try:
         if command == "angle":
@@ -704,9 +793,7 @@ def run(
             if reply is not None:
                 res = parse_limit_angle_reply(reply)
                 if res is not None:
-                    print("yaw   [{:7.1f}°, {:7.1f}°]  roll [{:7.1f}°, {:7.1f}°]  pitch [{:7.1f}°, {:7.1f}°]".format(
-                        res["yaw_min"], res["yaw_max"], res["roll_min"], res["roll_max"],
-                        res["pitch_min"], res["pitch_max"]))
+                    print_limit_result(res)
                 else:
                     raw_info = limit_angle_reply_raw(reply)
                     if raw_info is not None:
@@ -781,7 +868,7 @@ def run(
                 print("Command sent (no reply; gimbal may have executed).")
 
         elif command == "activetrack":
-            print("Toggling ActiveTrack...")
+            print("Toggling ActiveTrack (no on/off status from the gimbal; needs RavenEye or a tracking module).")
             reply = request_reply(build_activetrack_toggle(), 0x0E, 0x11, timeout=1.0)
             if reply is not None:
                 r = validate_sdk_reply(reply)
@@ -834,7 +921,7 @@ def run(
                 print("(no reply)")
 
         elif command == "listen":
-            print("Parameter push enabled; listening for pushes (0x08, 0x10). Ctrl+C to stop.")
+            print("Parameter push enabled; listening for 0x08 / 0x10 pushes and 0x0D/0x01. Ctrl+C to stop.")
             _send_packet(bus, build_set_parameter_push(True))
             time.sleep(0.1)
             while True:
@@ -874,9 +961,8 @@ def run(
             if reply is not None:
                 res = parse_limit_angle_reply(reply)
                 if res is not None:
-                    print("Limit: yaw [{:.1f},{:.1f}°] roll [{:.1f},{:.1f}°] pitch [{:.1f},{:.1f}°]".format(
-                        res["yaw_min"], res["yaw_max"], res["roll_min"], res["roll_max"],
-                        res["pitch_min"], res["pitch_max"]))
+                    print("Limit: ", end="")
+                    print_limit_result(res)
                 else:
                     raw_info = limit_angle_reply_raw(reply)
                     if raw_info is not None:
@@ -915,7 +1001,7 @@ def run(
             if pos < 0 or pos > 4096:
                 print("focus-set position out of range (0–4096).")
                 return
-            print(f"Sending focus position: {pos} (0–4096).")
+            print("Sending focus-motor position: {} (0–4096; run motor-calib first if this drives zoom).".format(pos))
             pkt = build_focus_set(pos)
             reply = request_reply(pkt, 0x0E, 0x12, timeout=0.8)
             if reply is not None:
@@ -976,7 +1062,8 @@ def run(
             print("Unknown command: {}".format(command))
             print("Use: angle, joint, version, limit, stiffness, user-params, recenter, selfie, activetrack,")
             print("     push-on, push-off, position, speed, listen, info, focus-set, focus-get,")
-            print("     sleep, wake, rec-start, rec-stop, focus-center-start, focus-center-stop")
+            print("     sleep, wake, calibrate/autotune, motor-calib, rec-start, rec-stop,")
+            print("     focus-center-start, focus-center-stop, cam-cmd, user-params-poll")
     except KeyboardInterrupt:
         pass
     finally:
@@ -985,7 +1072,7 @@ def run(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="DJI gimbal/CAN console via SH-C31G (Canable 2.0). Commands: angle, position, speed, limit, stiffness, user-params, recenter, selfie, activetrack, sleep, wake, rec-start/stop, focus-center-start/stop, push-on/off, listen, info.",
+        description="DJI gimbal/CAN console via SH-C31G (Canable 2.0).",
     )
     parser.add_argument(
         "channel",
@@ -1001,19 +1088,20 @@ def main() -> int:
             "recenter", "selfie", "activetrack", "push-on", "push-off",
             "position", "speed", "listen", "info", "focus-set", "focus-get",
             *PROBE_COMMANDS,
+            *COMMAND_ALIASES,
         ],
         help=(
-            "Command. For position pass extra args (e.g. -c position 0 0 -90). "
-            "For speed pass yaw roll pitch deg/s (e.g. -c speed 10 0 -5). "
-            "For focus-set pass focus position 0–4096 (e.g. -c focus-set 2048). "
-            "sleep/wake/rec-*/focus-center-* execute if accepted; replies print cmd_set/cmd_id/ret/hex. "
+            "Command. position: yaw roll pitch °. speed: yaw roll pitch °/s. "
+            "focus-set / zoom-set: 0–4096 after motor-calib. "
+            "calibrate/autotune retunes gimbal motors. motor-calib finds focus-motor endpoints. "
+            "activetrack toggles with no status bit. rec-* needs a DJI camera-control cable. "
             "Default: angle"
         ),
     )
     parser.add_argument(
         "extra",
         nargs="*",
-        help="Extra args for position (yaw roll pitch °) or speed (yaw roll pitch °/s).",
+        help="Extra args for position (yaw roll pitch °), speed (yaw roll pitch °/s), or focus-set/zoom-set (0–4096).",
     )
     parser.add_argument(
         "-i", "--interval",
