@@ -1,16 +1,19 @@
 # DJI R SDK Gimbal Protocol (CAN Transport)
 
-This document describes the DJI R SDK external protocol as used by `dji_gimbal_cli.py` to control a DJI RS gimbal over CAN.
+This document describes the DJI R SDK external protocol as used by `dji_gimbal_cli.py` to control a DJI RS gimbal over CAN. It applies to RS 2 / RS 2 Pro / RS 3 Pro / RS 4 / RS 4 Pro / RS 5 accessory CAN (including the RSA port, which carries 5 V and CAN on the same connector).
 
 - **Physical transport**: CAN bus via SLCAN adapter (e.g. SH-C31G / Canable 2.0)
 - **Bitrate**: `1_000_000` bps (1 Mbps)
 - **SOF (start-of-frame)**: `0xAA`
 - **Command set (gimbal)**: `0x0E`
+- **Command set (camera record / focus-center)**: `0x0D`
 - **CAN IDs**:
   - Host → gimbal: `0x223`
   - Gimbal → host: `0x222`
 
 The CLI splits logical SDK packets into CAN frames with up to 8 bytes of data each.
+
+Encodings in this document were checked against canned SDK packets from a working CAN client. CRC-16 and CRC-32 match `dji_gimbal_cli.py` byte-for-byte when the sequence number matches. Host requests in that client use `CMD_TYPE = 0x03` except for a periodic user-params poll (`CMD_TYPE = 0x02`).
 
 ---
 
@@ -43,7 +46,7 @@ Byte 4      : ENC              (encryption flag; 0x00 = none)
 Bytes 5–7   : RES              (3 bytes reserved; all 0x00)
 Bytes 8–9   : SEQ              (sequence number, little-endian)
 Bytes 10–11 : CRC16            (CRC-16 over bytes 0–9, little-endian)
-Byte 12     : CMD_SET          (command set; 0x0E for gimbal)
+Byte 12     : CMD_SET          (command set; 0x0E gimbal, 0x0D camera)
 Byte 13     : CMD_ID           (command ID within set)
 Bytes 14..N-5 : DATA           (command-specific payload)
 Bytes N-4..N-1 : CRC32         (CRC-32 over bytes 0..N-5, little-endian)
@@ -82,11 +85,13 @@ The actual packet length must match `pack_len`, otherwise the packet is rejected
 
 Byte 3 carries the command type and some flags:
 
-- For host-originated commands, the CLI uses:
+- For host-originated commands that expect a reply, the CLI and the working client use:
 
   ```text
   CMD_TYPE_REPLY_REQUIRED = 0x03
   ```
+
+- One canned poll uses `CMD_TYPE = 0x02` (user-params, section 16). Treat that as "send, do not wait for a matching reply."
 
 - For replies from the gimbal, bit `0x20` must be set; otherwise the packet is not treated as a reply:
 
@@ -151,8 +156,7 @@ Only packets that pass all steps are considered valid.
 
 ### 4.1 Physical Connector
 
-The gimbal/accessory's CAN port (same 4-pin connector family used on DJI Focus motor units
-and other CAN-based accessories) exposes:
+The gimbal/accessory CAN path (RSA port on current RS gimbals, or the 4-pin connector family used on DJI Focus motor units and other CAN accessories) exposes:
 
 | Pin | Signal   | Notes                                                                 |
 |-----|----------|------------------------------------------------------------------------|
@@ -161,10 +165,8 @@ and other CAN-based accessories) exposes:
 | 3   | `CANH`   | CAN bus high                                                            |
 | 4   | `CANL`   | CAN bus low                                                             |
 
-Next to the port is a slide switch labeled **`S-BUS` / `CAN`**. It must be set to **`CAN`**
-— in the `S-BUS` position the port instead speaks the single-wire S-BUS/PWM protocol used by
-some third-party focus controllers, not the DJI R SDK packet format documented in this file.
-If you wire up an adapter and get nothing but silence on `0x222`, check this switch first.
+Next to the 4-pin accessory port is a slide switch labeled **`S-BUS` / `CAN`**. It must be set to **`CAN`**
+for this protocol. In the `S-BUS` position the port speaks analog S-BUS/PWM (legacy Ronin-S / SC / 2 joystick control), not the DJI R SDK packet format. If you wire up an adapter and get nothing but silence on `0x222`, check this switch first.
 
 This is the same pinout the SH-C31G/Canable adapter's flying leads were wired to: `CANH`/
 `CANL` to the transceiver's bus pins, `GND` common, `VCC_5V` left unconnected (adapter
@@ -188,6 +190,8 @@ for i in range(0, len(pkt), 8):
     send CAN frame with arbitration_id=0x223 and data=pkt[i : i+8]
 ```
 
+Packets of 19–21 bytes (sleep, wake, record, recenter, AutoTune, ActiveTrack, motor-calib) become three frames: 8 + 8 + remainder. Speed is 25 bytes (four frames, last length 1). Position is 26 bytes (four frames, last length 2).
+
 On reception, the CLI:
 
 1. Filters by arbitration ID `0x222`.
@@ -195,6 +199,16 @@ On reception, the CLI:
 3. Detects `SOF` and length.
 4. Validates CRC-16 and CRC-32.
 5. Emits a complete SDK packet when fully reassembled and valid.
+
+Observed reply / push lengths from a working client (it only starts reassembly for these; the CLI accepts any CRC-valid length):
+
+| Total length | Typical contents |
+|-------------:|------------------|
+| 20 (`0x14`) | Camera `0x0D/0x01` reply |
+| 25 (`0x19`) | Speed reply, or compact limits, or short `0x08` push |
+| 26 (`0x1A`) | Angle reply `0x0E/0x02` |
+| 28 (`0x1C`) | User-params reply `0x0E/0x0B` |
+| 40 (`0x28`) | Parameter push `0x0E/0x08` with extra fields |
 
 ---
 
@@ -239,9 +253,11 @@ Most of the CLI commands treat `ret_code == 0x00` as success and display additio
 
 ## 6. Gimbal Command Set 0x0E
 
-All gimbal-related commands in the CLI use:
+Gimbal motion, telemetry, and sleep/wake in the CLI use:
 
 - `CMD_SET = 0x0E`
+
+Camera record and Ronin focus-center use `CMD_SET = 0x0D` (section 22). Those are a different command set, not extra `0x0E` cmd_ids.
 
 The sections below document each observed command (CMD_ID) and payload.
 
@@ -258,10 +274,14 @@ The sections below document each observed command (CMD_ID) and payload.
 |  0x0E   | 0x08   | gimbal → host   | Gimbal parameter push (angles)      |
 |  0x0E   | 0x09   | host ↔ gimbal   | Obtain module version               |
 |  0x0E   | 0x0B   | host ↔ gimbal   | Obtain gimbal user parameters       |
+|  0x0E   | 0x0C   | host ↔ gimbal   | Sleep / wake                        |
 |  0x0E   | 0x0E   | host ↔ gimbal   | Recenter / Selfie                   |
-|  0x0E   | 0x10   | gimbal → host   | Auto-calibration status push        |
-|  0x0E   | 0x11   | host ↔ gimbal   | ActiveTrack toggle                  |
-|  0x0E   | 0x12   | host ↔ gimbal   | Focus motor control / query         |
+|  0x0E   | 0x0F   | host ↔ gimbal   | AutoTune (retune motors for payload) |
+|  0x0E   | 0x10   | gimbal → host   | AutoTune / calibration status push   |
+|  0x0E   | 0x11   | host ↔ gimbal   | ActiveTrack toggle                   |
+|  0x0E   | 0x12   | host ↔ gimbal   | Focus motor (position / query / autocal) |
+|  0x0D   | 0x00   | host → camera   | Record / center-focus (section 22)   |
+|  0x0D   | 0x01   | host → camera   | Camera query, DATA `01`              |
 
 The following subsections describe the payloads and expected replies.
 
@@ -354,7 +374,11 @@ Units and clamping:
 
 Control byte:
 
-- The CLI always sends `0x88`, described as "take over speed control".
+- Bit 7 set means the host is taking speed control.
+- A working CAN client sends `0x80`. The CLI uses `0x80` (`SPEED_CTRL_TAKEOVER`).
+- Older notes used `0x88` (bit 3 also set). That still builds; pass `ctrl=0x88` if you need to compare.
+
+Pan/tilt from a joystick or on-screen pad is this command, not position (`0x00`). Position is for absolute/incremental moves (presets). On RS 4 / RS 4 Pro / RS 5, axis endpoints set on the gimbal itself are ignored by the SDK speed/position path unless the host is driving in a joystick-style mode that honours the gimbal's own speed, smoothness, and endpoints.
 
 ### 8.2 Reply
 
@@ -406,14 +430,22 @@ The CLI uses this for:
 
 ## 10. Obtain Gimbal Limit Angles – CMD_ID 0x04
 
-**Purpose**: Obtain configured gimbal axis limits (min/max per axis).
+**Purpose**: Obtain configured gimbal axis endpoints (min/max pan, roll, tilt).
 
 - **Command set**: `0x0E`
 - **Command ID**: `0x04`
 
+These are the software travel limits used to stop cable wrap and overshoot. Resetting them restores full-range motion.
+
 ### 10.1 Request Payload
 
-No payload (`DATA` is empty).
+A working CAN client sends a single byte:
+
+```text
+query uint8   # 0x01
+```
+
+Empty `DATA` is also used by the original DJI R SDK write-up. The CLI sends `01` by default (`build_obtain_gimbal_limit_angle()`). The 13-byte reply layout below has a 1-byte prefix that matches this query byte.
 
 ### 10.2 Reply Payload
 
@@ -442,9 +474,11 @@ Two observed formats (all int16 in 0.1° units):
    pitch_max int16
    ```
 
-All values are scaled by 0.1 when presented in degrees.
+All int16 values are scaled by 0.1 when presented in degrees.
 
-If decoding fails but `ret_code == 0x00`, the CLI prints the raw payload length and hex representation for further analysis.
+3. **6 bytes after `ret_code`** (25-byte packet). A working client stores these six bytes as the endpoint snapshot and does not parse 6×int16. The CLI prints that compact payload as hex when it sees it.
+
+If decoding fails but `ret_code == 0x00`, the CLI prints the raw payload length and hex.
 
 ---
 
@@ -512,28 +546,25 @@ After enabling push, the gimbal will start sending unsolicited packets with:
 
 ### 13.1 Payload Layout
 
-Same as angle reply:
+Unsolicited push does not use byte 14 as a DJI return code. A working RX parser treats it as flags:
 
 ```text
-data_type uint8  (mode / angle type)
-yaw       int16  (0.1°)
-roll      int16  (0.1°)
-pitch     int16  (0.1°)
+flags    uint8   # bit 0 set → the next 6 bytes are yaw/roll/pitch
+yaw      int16   (0.1°)
+roll     int16   (0.1°)
+pitch    int16   (0.1°)
+…        optional extra bytes (40-byte / 0x28 pushes)
 ```
 
-If payload length is at least 7 bytes, the CLI decodes and prints:
+Total packet length 25 (`0x19`) is the short form. Length 40 (`0x28`) carries extra fields after the three angles.
 
-```text
-[push] gimbal params: yaw=X.X° roll=Y.Y° pitch=Z.Z°
-```
-
-Otherwise, it prints raw hex data for investigation.
+The CLI (`-c listen`) decodes flags-then-int16 first. If that does not fit, it falls back to the angle-reply layout (`data_type` + 3×int16 after byte 14).
 
 ---
 
-## 14. Auto-Calibration Status Push – CMD_ID 0x10 (Unsolicited)
+## 14. AutoTune Status Push – CMD_ID 0x10 (Unsolicited)
 
-**Purpose**: Status updates for automatic gimbal calibration.
+**Purpose**: Status updates while AutoTune (`0x0F`) is running.
 
 - **Command set**: `0x0E`
 - **Command ID**: `0x10`
@@ -601,7 +632,13 @@ version string = "A.B.C.D"
 
 ### 16.1 Request Payload
 
-No payload (`DATA` is empty).
+Two encodings are in use:
+
+1. **Explicit query (CLI `user-params`)**  
+   Empty `DATA`, `CMD_TYPE = 0x03`.
+
+2. **Periodic poll (CLI `user-params-poll`)**  
+   `CMD_TYPE = 0x02`, `DATA = 00 22 23`. A working client sends this on a ~500 ms cadence (25 ticks of a 20 ms loop) and does not wait for a reply. The three payload bytes look like a dummy byte plus the CAN IDs `0x22` / `0x23`; they have not been decoded further.
 
 ### 16.2 Reply Payload
 
@@ -615,14 +652,48 @@ Future work could decode individual user parameters based on further firmware an
 
 ---
 
-## 17. Recenter / Selfie – CMD_ID 0x0E
+## 17. Sleep / Wake – CMD_ID 0x0C
+
+**Purpose**: Sleep the gimbal between takes, or wake it. Instant on/off of the motors, not a full power cycle.
+
+- **Command set**: `0x0E`
+- **Command ID**: `0x0C`
+
+This is not recenter. Recenter is `CMD_SET = 0x0E`, `CMD_ID = 0x0E`, payload `FE 01` (section 18). Sleep and wake share `CMD_ID = 0x0C`. The last payload byte is the switch.
+
+### 17.1 Request Payload
+
+Three bytes. Total SDK packet length is 21.
+
+```text
+0x23  uint8  # constant
+0x01  uint8  # constant
+mode  uint8
+    0x01 → sleep  (CLI: sleep)
+    0x00 → wake   (CLI: wake)
+```
+
+CLI builders:
+
+- `build_sleep()` → `0x0E / 0x0C / 23 01 01`
+- `build_wake()`  → `0x0E / 0x0C / 23 01 00`
+
+### 17.2 Reply
+
+- Reply command: `CMD_SET = 0x0E`, `CMD_ID = 0x0C`.
+- The CLI prints `cmd_set`, `cmd_id`, `ret_code`, and payload hex from the `0x222` reply.
+- These commands execute if the gimbal accepts them. Use `sleep` only when you mean to sleep the unit.
+
+---
+
+## 18. Recenter / Selfie – CMD_ID 0x0E
 
 **Purpose**: Trigger a recenter or selfie operation.
 
 - **Command set**: `0x0E`
 - **Command ID**: `0x0E`
 
-### 17.1 Request Payload
+### 18.1 Request Payload
 
 Two bytes:
 
@@ -633,22 +704,59 @@ mode uint8
     0x02 → Selfie once
 ```
 
-### 17.2 Reply
+### 18.2 Reply
 
 - Reply command: `CMD_SET = 0x0E`, `CMD_ID = 0x0E`.
 - `ret_code == 0x00` → success.
 - The CLI also treats a missing reply as "command may still have executed" based on empirical behavior.
 
+Do not confuse this with sleep/wake (`CMD_ID = 0x0C`, payload `23 01 xx`). A working client sends recenter `FE 01` only; selfie `FE 02` is still in the CLI but was not in that client's canned TX list.
+
 ---
 
-## 18. ActiveTrack Toggle – CMD_ID 0x11
+## 19. AutoTune – CMD_ID 0x0F
 
-**Purpose**: Toggle ActiveTrack on/off.
+**Purpose**: Retune the gimbal motors for the current payload (AutoTune). This is not focus-motor lens calibration (`0x12` `02 00 01`, section 21.3). Status arrives as unsolicited `CMD_ID = 0x10` pushes (section 14).
+
+- **Command set**: `0x0E`
+- **Command ID**: `0x0F`
+
+A working CAN client keeps this packet next to recenter (`FE 01`) and ActiveTrack (`03`) in the same template block. CRC-16/CRC-32 check out.
+
+### 19.1 Request Payload
+
+Three bytes. Total SDK packet length is 21.
+
+```text
+0x00  uint8
+0x01  uint8
+0x01  uint8
+```
+
+CLI: `build_calibrate()` / `-c calibrate` / `-c autotune` → `0x0E / 0x0F / 00 01 01`
+
+### 19.2 Reply
+
+- Reply command: `CMD_SET = 0x0E`, `CMD_ID = 0x0F`.
+- The CLI prints `cmd_set`, `cmd_id`, `ret_code`, and payload hex.
+- After success, watch `CMD_ID = 0x10` pushes (`-c listen`) for calibration progress.
+
+This starts a physical motor-tune sequence. Use it when you mean to.
+
+---
+
+## 20. ActiveTrack Toggle – CMD_ID 0x11
+
+**Purpose**: Toggle ActiveTrack on the gimbal. The gimbal does not report whether tracking is currently on or off; send the same packet again to stop.
+
+Requires a tracking accessory (RavenEye, or the Intelligent Tracking Module / Enhanced module on RS 4 / RS 4 Pro / RS 5). Center the subject in frame before toggling.
+
+Speed commands (`0x01`) can still reframe while tracking is on, on gimbals that honour joystick-style control during ActiveTrack.
 
 - **Command set**: `0x0E`
 - **Command ID**: `0x11`
 
-### 18.1 Request Payload
+### 20.1 Request Payload
 
 Single byte:
 
@@ -656,26 +764,31 @@ Single byte:
 0x03  uint8  # toggle ActiveTrack start/stop
 ```
 
-### 18.2 Reply
+### 20.2 Reply
 
 - Reply command: `CMD_SET = 0x0E`, `CMD_ID = 0x11`.
-- `ret_code == 0x00` → ActiveTrack toggled successfully.
+- `ret_code == 0x00` means the toggle was accepted, not that tracking is now "on".
 
 ---
 
-## 19. Focus Motor Control and Query – CMD_ID 0x12
+## 21. Focus Motor Control and Query – CMD_ID 0x12
 
-**Purpose**: Control and query the external focus motor.
+**Purpose**: Control and query the DJI Focus Motor.
+
+On RS 2 / RS 2 Pro / RS 3 Pro / RS 4 / RS 4 Pro / RS 5 this motor is typically used as **zoom**: after autocalibration, position `0` is wide and `4096` is tight. Set the motor LED to F (Focus) mode even when driving zoom; the SDK only talks to that mode. One motor at a time.
+
+Camera center-focus (tap-to-focus on the body) is `CMD_SET = 0x0D` (section 22), not this command.
 
 - **Command set**: `0x0E`
 - **Command ID**: `0x12`
 
-There are at least two sub-operations:
+There are three request layouts:
 
-1. Set focus position (`focus-set`).
-2. Get focus position (`focus-get`).
+1. Set motor position (`focus-set` / `zoom-set`).
+2. Get motor position (`focus-get`).
+3. Autocalibrate lens endpoints (`motor-calib`).
 
-### 19.1 Set Focus Position (`focus-set`)
+### 21.1 Set Focus Position (`focus-set`)
 
 **Request payload**:
 
@@ -693,7 +806,7 @@ Fields:
 - `ctl_type   = 0x00`
 - `data_len   = 0x02` (two-byte position field)
 - `position`:
-  - Range typically `0–4096`.
+  - Range `0–4096` after a successful `motor-calib`.
   - CLI clamps user input to `[0, 4096]`.
 
 **Reply payload**:
@@ -712,7 +825,7 @@ focus_pos = struct.unpack_from("<I", data, len(data) - 4)[0]
 
 Values are typically in the range `0–4096`.
 
-### 19.2 Get Focus Position (`focus-get`)
+### 21.2 Get Focus Position (`focus-get`)
 
 **Request payload**:
 
@@ -721,7 +834,7 @@ Values are typically in the range `0–4096`.
 0x00  uint8
 ```
 
-These bytes match a reference implementation (`getFocPosData`) observed in the firmware.
+These bytes match the focus-position query used by a working CAN client.
 
 **Reply payload**:
 
@@ -735,13 +848,79 @@ If decoding fails, the CLI falls back to printing:
 - `len(data)`
 - `data` in hex.
 
+### 21.3 Motor autocalibrate (`motor-calib`)
+
+**Request payload**:
+
+```text
+0x02  uint8
+0x00  uint8
+0x01  uint8
+```
+
+This is the Focus Motor Autocalibration command (lens endpoints). Distinct from gimbal AutoTune (`0x0F`). Total SDK packet length is 21.
+
+CLI: `build_motor_calib()` / `-c motor-calib` (alias `-c focus-02`). The motor runs to both ends of the lens; hold the lens if the gear slips.
+
 ---
 
-## 20. High-Level Interaction Patterns
+## 22. Camera Command Set 0x0D
+
+**Purpose**: Trigger record and center-focus on a camera attached through the DJI camera-control cable (the USB-C / control cable that ships with most RS gimbals). No separate network path on the camera is required. Nikon, Fujifilm, Sigma, and similar bodies that the gimbal already supports are the typical targets. Sony / Blackmagic over Wi-Fi or Bluetooth do not use this command set.
+
+- **Command set**: `0x0D`
+- **Command ID**: `0x00` for the four CLI commands below
+
+| CLI | DATA |
+|-----|------|
+| `rec-start` | `03 00` |
+| `rec-stop` | `04 00` |
+| `focus-center-start` | `05 00` |
+| `focus-center-stop` | `0B 00` |
+
+Total SDK packet length is 20 (2-byte payload).
+
+### 22.1 Request Payload
+
+```text
+op    uint8
+0x00  uint8  # constant
+```
+
+`op` values:
+
+- `0x03` record start
+- `0x04` record stop
+- `0x05` focus-center start
+- `0x0B` focus-center stop
+
+CLI builders: `build_record_start()`, `build_record_stop()`, `build_focus_center_start()`, `build_focus_center_stop()`.
+
+### 22.2 Reply
+
+- Reply command: `CMD_SET = 0x0D`, `CMD_ID = 0x00`.
+- The CLI prints `cmd_set`, `cmd_id`, `ret_code`, and payload hex from the `0x222` reply.
+- These commands execute if accepted. `rec-start` starts recording on a camera the gimbal can already control.
+
+### 22.3 Camera CMD_ID 0x01 (`cam-cmd`)
+
+A working client also sends:
+
+```text
+CMD_SET = 0x0D
+CMD_ID  = 0x01
+DATA    = 01
+```
+
+Total SDK packet length is 19. A working client sends this next to record-start and treats a reply whose first payload byte is `0x02` as the interesting state. The CLI exposes it as `cam-cmd` and prints that byte.
+
+---
+
+## 23. High-Level Interaction Patterns
 
 The CLI (`dji_gimbal_cli.py`) demonstrates several typical flows:
 
-### 20.1 Continuous Angle Streaming
+### 23.1 Continuous Angle Streaming
 
 - `angle`:
   - Repeatedly sends `CMD_SET = 0x0E`, `CMD_ID = 0x02`, `DATA = [0x01]` (attitude angles).
@@ -749,18 +928,18 @@ The CLI (`dji_gimbal_cli.py`) demonstrates several typical flows:
 - `joint`:
   - Same, but `DATA = [0x02]` (joint angles).
 
-### 20.2 One-Shot Info Query
+### 23.2 One-Shot Info Query
 
 The `info` command performs a sequence:
 
 1. Obtain attitude angles (`0x02`).
 2. Obtain module version (`0x09`).
-3. Obtain gimbal limit angles (`0x04`).
+3. Obtain gimbal limit angles (`0x04`, DATA `01`).
 4. Obtain motor stiffness (`0x06`).
 
 All results are printed in a human-readable format for quick diagnostics.
 
-### 20.3 Push-Based Telemetry
+### 23.3 Push-Based Telemetry
 
 - `push-on`:
   - Sends `CMD_SET = 0x0E`, `CMD_ID = 0x07`, `DATA = [0x01]`.
@@ -769,13 +948,47 @@ All results are printed in a human-readable format for quick diagnostics.
   - Ensures push is enabled.
   - Continuously reads from CAN ID `0x222`.
   - Reassembles SDK packets.
-  - For each valid packet in the gimbal command set (`CMD_SET = 0x0E`), tries to handle:
-    - `CMD_ID = 0x08`: gimbal parameter push (angles).
-    - `CMD_ID = 0x10`: auto-calibration status.
+  - Prints `0x08` pushes (25-byte and 40-byte), `0x10` AutoTune status, and `0x0D/0x01` camera replies.
+
+### 23.4 One-shot motion, camera, and motor commands
+
+These one-shot commands print the TX encoding, then the `0x222` reply as `cmd_set`, `cmd_id`, `ret_code`, and payload hex. They execute if the gimbal accepts them.
+
+```text
+python dji_gimbal_cli.py COM6 -c sleep
+python dji_gimbal_cli.py COM6 -c wake
+python dji_gimbal_cli.py COM6 -c calibrate
+python dji_gimbal_cli.py COM6 -c motor-calib
+python dji_gimbal_cli.py COM6 -c rec-start
+python dji_gimbal_cli.py COM6 -c rec-stop
+python dji_gimbal_cli.py COM6 -c focus-center-start
+python dji_gimbal_cli.py COM6 -c focus-center-stop
+python dji_gimbal_cli.py COM6 -c cam-cmd
+python dji_gimbal_cli.py COM6 -c activetrack
+```
+
+| CLI | CMD_SET | CMD_ID | DATA | CMD_TYPE |
+|-----|---------|--------|------|----------|
+| `sleep` | `0x0E` | `0x0C` | `23 01 01` | `0x03` |
+| `wake` | `0x0E` | `0x0C` | `23 01 00` | `0x03` |
+| `calibrate` / `autotune` | `0x0E` | `0x0F` | `00 01 01` | `0x03` |
+| `recenter` | `0x0E` | `0x0E` | `FE 01` | `0x03` |
+| `activetrack` | `0x0E` | `0x11` | `03` | `0x03` |
+| `limit` | `0x0E` | `0x04` | `01` | `0x03` |
+| `user-params-poll` | `0x0E` | `0x0B` | `00 22 23` | `0x02` |
+| `motor-calib` | `0x0E` | `0x12` | `02 00 01` | `0x03` |
+| `speed` | `0x0E` | `0x01` | 3×int16 + `80` | `0x03` |
+| `rec-start` | `0x0D` | `0x00` | `03 00` | `0x03` |
+| `rec-stop` | `0x0D` | `0x00` | `04 00` | `0x03` |
+| `focus-center-start` | `0x0D` | `0x00` | `05 00` | `0x03` |
+| `focus-center-stop` | `0x0D` | `0x00` | `0B 00` | `0x03` |
+| `cam-cmd` | `0x0D` | `0x01` | `01` | `0x03` |
+
+Sleep, wake, record, center-focus, recenter, ActiveTrack, and motor-calib match canned packets (CRC included, once SEQ is aligned). AutoTune, limits `01`, `cam-cmd`, speed ctrl `0x80`, and the user-params poll come from the same client. `focus-02` is an alias for `motor-calib`. `zoom-set` is an alias for `focus-set`.
 
 ---
 
-## 21. Implementing a Custom Client
+## 24. Implementing a Custom Client
 
 To implement your own client in another language or environment:
 
@@ -799,7 +1012,7 @@ To implement your own client in another language or environment:
      - Validate CRC-16 and CRC-32.
    - Treat packets with `(byte3 & 0x20) != 0` as replies or pushes.
 5. **Decode commands**:
-   - Use `CMD_SET = 0x0E` and `CMD_ID` as documented above.
+   - Use `CMD_SET` and `CMD_ID` as documented above (`0x0E` gimbal, `0x0D` camera-control cable).
    - Parse payloads according to the sections in this document.
 6. **Handle return codes**:
    - Use `ret_code` to classify success vs. parse/execute/undefined errors.
