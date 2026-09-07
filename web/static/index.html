@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Gimbal control</title>
+  <style>
+    :root {
+      --bg: #101214;
+      --panel: #1a1d22;
+      --panel-2: #22262d;
+      --line: #2e333c;
+      --text: #ecece8;
+      --muted: #8d939c;
+      --amber: #d9a441;
+      --amber-dim: #8a6b28;
+      --ok: #7cb87c;
+      --bad: #d16a6a;
+      --stick: #2a2f38;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
+    body {
+      font: 14px/1.4 "Segoe UI", system-ui, sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .status-dot {
+      width: 9px; height: 9px; border-radius: 50%;
+      background: var(--bad);
+      flex: 0 0 auto;
+    }
+    .status-dot.ok { background: var(--ok); }
+    .status-text { color: var(--muted); font-size: 13px; }
+    .grow { flex: 1; }
+    select, input[type="number"], button {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font: inherit;
+    }
+    button { cursor: pointer; }
+    button:hover { border-color: var(--amber-dim); }
+    button.primary { background: var(--amber); color: #1a1408; border-color: var(--amber); font-weight: 600; }
+    button.danger { border-color: #6a3333; color: #f0c0c0; }
+    button.warn { border-color: var(--amber-dim); color: var(--amber); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    main {
+      display: grid;
+      grid-template-columns: minmax(280px, 1fr) 340px 280px;
+      gap: 16px;
+      padding: 16px 20px 24px;
+      max-width: 1280px;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+    section h2 {
+      margin: 0 0 12px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .angles {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .angle {
+      background: var(--panel-2);
+      border-radius: 8px;
+      padding: 10px 8px;
+      text-align: center;
+    }
+    .angle label { display: block; color: var(--muted); font-size: 11px; letter-spacing: 0.08em; }
+    .angle b { font-size: 22px; font-variant-numeric: tabular-nums; font-weight: 600; }
+    .pad-wrap {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      justify-content: center;
+    }
+    .stick {
+      width: 240px; height: 240px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 50% 50%, #252a32, var(--stick));
+      border: 1px solid var(--line);
+      position: relative;
+      touch-action: none;
+      user-select: none;
+    }
+    .stick .cross {
+      position: absolute; inset: 0;
+      background:
+        linear-gradient(var(--line), var(--line)) center/1px 100% no-repeat,
+        linear-gradient(var(--line), var(--line)) center/100% 1px no-repeat;
+      opacity: 0.5;
+      pointer-events: none;
+    }
+    .knob {
+      width: 56px; height: 56px;
+      border-radius: 50%;
+      background: var(--amber);
+      position: absolute;
+      left: 50%; top: 50%;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      pointer-events: none;
+    }
+    .roll-col { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+    .roll-col button { width: 72px; padding: 18px 8px; }
+    .meta { margin-top: 12px; color: var(--muted); font-size: 12px; text-align: center; }
+    .speed-row { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+    .speed-row input[type="range"] { flex: 1; }
+    label.row { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; }
+    .grid-btns {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .grid-btns button { padding: 10px 8px; }
+    .goto {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .goto label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+    .goto input { width: 100%; }
+    .zoom input[type="range"] { width: 100%; }
+    .zoom-val { font-variant-numeric: tabular-nums; color: var(--text); }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 10px; }
+    .err { color: var(--bad); font-size: 12px; min-height: 1.2em; }
+    @media (max-width: 980px) {
+      main { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <span id="dot" class="status-dot"></span>
+    <h1>Gimbal</h1>
+    <span id="statusText" class="status-text">Disconnected</span>
+    <span class="grow"></span>
+    <select id="adapter"></select>
+    <button class="primary" id="btnConnect">Connect</button>
+    <button id="btnDisconnect" disabled>Disconnect</button>
+  </header>
+  <main>
+    <section>
+      <h2>Pan / tilt</h2>
+      <div class="angles">
+        <div class="angle"><label>Yaw</label><b id="yaw">—</b></div>
+        <div class="angle"><label>Roll</label><b id="roll">—</b></div>
+        <div class="angle"><label>Pitch</label><b id="pitch">—</b></div>
+      </div>
+      <div class="pad-wrap">
+        <div class="stick" id="stick">
+          <div class="cross"></div>
+          <div class="knob" id="knob"></div>
+        </div>
+        <div class="roll-col">
+          <button id="rollPos" title="Roll +">Roll +</button>
+          <button id="btnStop">Stop</button>
+          <button id="rollNeg" title="Roll −">Roll −</button>
+        </div>
+      </div>
+      <div class="speed-row">
+        <label class="row" style="width:100%"><span>Max rate</span><span id="maxRateLabel">30°/s</span></label>
+      </div>
+      <input id="maxRate" type="range" min="5" max="120" value="30" />
+      <p class="meta">Drag the pad. WASD pan/tilt, Q/E roll, space to stop.</p>
+      <p class="err" id="err"></p>
+    </section>
+    <section>
+      <h2>Motion</h2>
+      <div class="grid-btns">
+        <button id="recenter">Recenter</button>
+        <button id="activetrack">ActiveTrack</button>
+        <button id="wake">Wake</button>
+        <button class="danger" data-confirm="Sleep the motors?" id="sleep">Sleep</button>
+        <button class="warn" data-confirm="Run AutoTune on the gimbal motors?" id="calibrate">AutoTune</button>
+        <button class="warn" data-confirm="Run focus-motor calibration? Hold the lens if the gear can slip." id="motor-calib">Motor calib</button>
+      </div>
+      <h2 style="margin-top:18px">Go to</h2>
+      <div class="goto">
+        <div><label>Yaw °</label><input type="number" id="gotoY" value="0" step="1" /></div>
+        <div><label>Roll °</label><input type="number" id="gotoR" value="0" step="1" /></div>
+        <div><label>Pitch °</label><input type="number" id="gotoP" value="0" step="1" /></div>
+      </div>
+      <button class="primary" id="btnGoto" style="width:100%">Go</button>
+      <h2 style="margin-top:18px">Zoom</h2>
+      <div class="zoom">
+        <label class="row"><span>Target</span><span class="zoom-val" id="zoomVal">0</span></label>
+        <input id="zoom" type="range" min="0" max="4096" value="0" />
+        <label class="row" style="margin-top:8px"><span>Now</span><span class="zoom-val" id="zoomNow">—</span></label>
+        <label class="row" style="margin-top:10px"><span>Max speed</span><span id="zoomVLabel">900 /s</span></label>
+        <input id="zoomVmax" type="range" min="150" max="4000" value="900" />
+        <label class="row"><span>Ease</span><span id="zoomALabel">1800 /s²</span></label>
+        <input id="zoomAccel" type="range" min="200" max="12000" value="1800" />
+      </div>
+      <p class="hint">The panel ramps toward the target at 20 Hz so the motor eases in and out. Run motor calib first, F mode. Rec and center-focus need the DJI camera-control cable.</p>
+    </section>
+    <section>
+      <h2>Camera</h2>
+      <div class="grid-btns">
+        <button id="rec-start">Rec start</button>
+        <button id="rec-stop">Rec stop</button>
+        <button id="focus-center-start">Center focus</button>
+        <button id="focus-center-stop">Focus stop</button>
+      </div>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const stick = $("stick");
+    const knob = $("knob");
+    let ws = null;
+    let connected = false;
+    let pointerId = null;
+    let yawRate = 0, pitchRate = 0, rollRate = 0;
+    let sending = false;
+    let zoomTimer = null;
+    let zoomProfileTimer = null;
+    let zoomTouched = false;
+    let keys = new Set();
+
+    function fmt(v) {
+      return v == null || Number.isNaN(v) ? "—" : v.toFixed(1) + "°";
+    }
+
+    function applyState(s) {
+      connected = !!s.connected;
+      $("dot").classList.toggle("ok", connected);
+      const bits = [];
+      if (connected) bits.push(s.adapter || "connected");
+      else bits.push("Disconnected");
+      if (s.last_error) bits.push(s.last_error);
+      $("statusText").textContent = bits.join(" · ");
+      $("err").textContent = s.last_error && connected ? s.last_error : "";
+      $("btnConnect").disabled = connected;
+      $("btnDisconnect").disabled = !connected;
+      document.querySelectorAll("main button, main input").forEach((el) => {
+        if (el.id === "btnConnect") return;
+        el.disabled = !connected;
+      });
+      $("yaw").textContent = fmt(s.yaw);
+      $("roll").textContent = fmt(s.roll);
+      $("pitch").textContent = fmt(s.pitch);
+      if (typeof s.zoom === "number") {
+        $("zoomNow").textContent = String(s.zoom);
+      }
+      if (typeof s.zoom_target === "number" && document.activeElement !== $("zoom") && !zoomTouched) {
+        $("zoom").value = String(s.zoom_target);
+        $("zoomVal").textContent = String(s.zoom_target);
+      }
+    }
+
+    async function loadAdapters() {
+      const res = await fetch("/api/adapters");
+      const data = await res.json();
+      const sel = $("adapter");
+      sel.innerHTML = "";
+      for (const a of data.adapters) {
+        const opt = document.createElement("option");
+        opt.value = JSON.stringify({ channel: a.device, interface: a.interface === "auto" ? null : a.interface });
+        opt.textContent = a.device === "auto" ? "Auto-detect" : `${a.device} — ${a.description}`;
+        sel.appendChild(opt);
+      }
+    }
+
+    async function connect() {
+      zoomTouched = false;
+      const sel = JSON.parse($("adapter").value);
+      const body = { channel: sel.channel === "auto" ? "auto" : sel.channel, interface: sel.interface };
+      const res = await fetch("/api/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      applyState(await res.json());
+      openWs();
+    }
+
+    async function disconnect() {
+      zoomTouched = false;
+      stopAll();
+      const res = await fetch("/api/disconnect", { method: "POST" });
+      applyState(await res.json());
+    }
+
+    function openWs() {
+      if (ws) ws.close();
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${proto}://${location.host}/ws`);
+      ws.onmessage = (ev) => applyState(JSON.parse(ev.data));
+      ws.onclose = () => { ws = null; };
+    }
+
+    function maxRate() {
+      return Number($("maxRate").value);
+    }
+
+    function setKnob(nx, ny) {
+      const r = stick.clientWidth / 2 - 28;
+      knob.style.transform = `translate(calc(-50% + ${nx * r}px), calc(-50% + ${ny * r}px))`;
+    }
+
+    function ratesFromStick(nx, ny) {
+      yawRate = nx * maxRate();
+      pitchRate = -ny * maxRate();
+    }
+
+    function pointerToNorm(ev) {
+      const rect = stick.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      let x = (ev.clientX - cx) / (rect.width / 2);
+      let y = (ev.clientY - cy) / (rect.height / 2);
+      const mag = Math.hypot(x, y);
+      if (mag > 1) { x /= mag; y /= mag; }
+      return [x, y];
+    }
+
+    function startHold() {
+      if (sending) return;
+      sending = true;
+      tickSpeed();
+    }
+
+    function tickSpeed() {
+      if (!sending) return;
+      fetch("/api/speed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaw: yawRate, roll: rollRate, pitch: pitchRate, hold: true }),
+      }).catch(() => {});
+      requestAnimationFrame(() => setTimeout(tickSpeed, 50));
+    }
+
+    function stopAll() {
+      sending = false;
+      yawRate = pitchRate = rollRate = 0;
+      setKnob(0, 0);
+      fetch("/api/command/stop", { method: "POST" }).catch(() => {});
+    }
+
+    stick.addEventListener("pointerdown", (ev) => {
+      pointerId = ev.pointerId;
+      stick.setPointerCapture(ev.pointerId);
+      const [x, y] = pointerToNorm(ev);
+      setKnob(x, y);
+      ratesFromStick(x, y);
+      startHold();
+    });
+    stick.addEventListener("pointermove", (ev) => {
+      if (pointerId !== ev.pointerId) return;
+      const [x, y] = pointerToNorm(ev);
+      setKnob(x, y);
+      ratesFromStick(x, y);
+    });
+    function endStick(ev) {
+      if (pointerId !== ev.pointerId) return;
+      pointerId = null;
+      yawRate = 0;
+      pitchRate = 0;
+      setKnob(0, 0);
+      if (!rollRate) stopAll();
+    }
+    stick.addEventListener("pointerup", endStick);
+    stick.addEventListener("pointercancel", endStick);
+
+    function holdRoll(sign, btn) {
+      const down = () => { rollRate = sign * maxRate() * 0.6; startHold(); };
+      const up = () => { rollRate = 0; if (!yawRate && !pitchRate) stopAll(); };
+      btn.addEventListener("pointerdown", down);
+      btn.addEventListener("pointerup", up);
+      btn.addEventListener("pointerleave", up);
+    }
+    holdRoll(1, $("rollPos"));
+    holdRoll(-1, $("rollNeg"));
+    $("btnStop").addEventListener("click", stopAll);
+
+    $("maxRate").addEventListener("input", () => {
+      $("maxRateLabel").textContent = $("maxRate").value + "°/s";
+    });
+
+    $("zoom").addEventListener("input", () => {
+      zoomTouched = true;
+      $("zoomVal").textContent = $("zoom").value;
+      clearTimeout(zoomTimer);
+      zoomTimer = setTimeout(() => {
+        fetch("/api/zoom", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ position: Number($("zoom").value) }),
+        }).catch(() => {});
+      }, 20);
+    });
+
+    function sendZoomProfile() {
+      $("zoomVLabel").textContent = $("zoomVmax").value + " /s";
+      $("zoomALabel").textContent = $("zoomAccel").value + " /s²";
+      clearTimeout(zoomProfileTimer);
+      zoomProfileTimer = setTimeout(() => {
+        fetch("/api/zoom/profile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            vmax: Number($("zoomVmax").value),
+            accel: Number($("zoomAccel").value),
+          }),
+        }).catch(() => {});
+      }, 40);
+    }
+    $("zoomVmax").addEventListener("input", sendZoomProfile);
+    $("zoomAccel").addEventListener("input", sendZoomProfile);
+
+    $("btnGoto").addEventListener("click", () => {
+      fetch("/api/position", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          yaw: Number($("gotoY").value),
+          roll: Number($("gotoR").value),
+          pitch: Number($("gotoP").value),
+          time_s: 0.8,
+        }),
+      }).catch(() => {});
+    });
+
+    async function sendCmd(name) {
+      await fetch("/api/command/" + name, { method: "POST" });
+    }
+
+    for (const id of [
+      "recenter", "activetrack", "wake", "sleep", "calibrate", "motor-calib",
+      "rec-start", "rec-stop", "focus-center-start", "focus-center-stop",
+    ]) {
+      const el = $(id);
+      el.addEventListener("click", () => {
+        const msg = el.getAttribute("data-confirm");
+        if (msg && !confirm(msg)) return;
+        sendCmd(id);
+      });
+    }
+
+    $("btnConnect").addEventListener("click", connect);
+    $("btnDisconnect").addEventListener("click", disconnect);
+
+    window.addEventListener("keydown", (ev) => {
+      if (["INPUT", "SELECT"].includes(ev.target.tagName)) return;
+      keys.add(ev.key.toLowerCase());
+      if (ev.key === " ") { ev.preventDefault(); stopAll(); return; }
+      applyKeys();
+    });
+    window.addEventListener("keyup", (ev) => {
+      keys.delete(ev.key.toLowerCase());
+      applyKeys();
+    });
+    function applyKeys() {
+      const m = maxRate();
+      yawRate = (keys.has("d") ? 1 : 0) - (keys.has("a") ? 1 : 0);
+      pitchRate = (keys.has("w") ? 1 : 0) - (keys.has("s") ? 1 : 0);
+      rollRate = (keys.has("e") ? 1 : 0) - (keys.has("q") ? 1 : 0);
+      yawRate *= m;
+      pitchRate *= m;
+      rollRate *= m * 0.6;
+      if (yawRate || pitchRate || rollRate) startHold();
+      else if (pointerId === null) stopAll();
+    }
+
+    loadAdapters().then(() => {
+      fetch("/api/state").then(r => r.json()).then((s) => {
+        applyState(s);
+        if (s.connected) openWs();
+      });
+    });
+  </script>
+</body>
+</html>
