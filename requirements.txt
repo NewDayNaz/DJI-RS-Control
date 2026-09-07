@@ -1,0 +1,14 @@
+# Direct deps for the committed Python tools:
+#   dji_gimbal_cli.py     python-can + pyserial (slcan)
+#   dji_can_session.py    python-can gs_usb + slcan, pyserial (used by dji_gimbal_web.py)
+#   dji_gimbal_web.py     FastAPI + uvicorn + pydantic
+#   dji_ble_cli.py        bleak
+#
+# python-can's gs_usb extra pulls gs-usb (and pyusb) for CANable candleLight.
+
+python-can[gs_usb]>=4.0.0
+pyserial>=3.5
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.0
+bleak>=0.21.1
