@@ -3,8 +3,10 @@
 ESP32 firmware that speaks the DJI R SDK CAN protocol (documented in
 [`docs/DJI_R_SDK_Protocol.md`](../../docs/DJI_R_SDK_Protocol.md), and previously exercised
 via [`dji_gimbal_cli.py`](../../dji_gimbal_cli.py) over a wired SH-C31G/Canable adapter) and
-exposes it as a phone/browser-friendly WebSocket + REST API with a built-in joystick web UI.
-The XIAO is powered from the DJI RS Focus Wheel's 4-pin CAN port (`VCC_5V` + `GND`).
+exposes it as a phone/browser-friendly WebSocket + REST API with a built-in joystick web UI,
+and as the camera-side of the IP PTZ protocols hardware joystick/keyboard controllers already
+speak (VISCA, Pelco-D, Panasonic AW). The XIAO is powered from the DJI RS Focus Wheel's 4-pin
+CAN port (`VCC_5V` + `GND`).
 
 This firmware tracks the **golden Python implementation** as its standard:
 
@@ -177,10 +179,40 @@ Device → browser: the state snapshot every 50 ms (20 Hz):
 - `POST /api/zoom` `{"position":2048}`
 - `POST /api/zoom/profile` `{"vmax":900,"accel":1800}`
 - `POST /api/command/<name>` — any named command from the table above
-- `GET  /api/status` → `{wifi_rssi, ip, ws_clients, can:{...}}` (ESP32 CAN diagnostics)
+- `GET  /api/status` → `{wifi_rssi, ip, ws_clients, can:{...}, ptz:{...}}` (ESP32 CAN + PTZ diagnostics)
+- `POST /api/ptz/profile` `{"max_rate":30,"invert_pan":false,"invert_tilt":false}`
 - `POST /api/can/probe` → TX a lone `0x100` frame to check for a bus peer
 
-### Zoom ramp
+## Hardware PTZ controllers
+
+The device pretends to be a PTZ camera on the LAN so a joystick/keyboard can drive the
+gimbal. Pan is yaw, tilt is pitch, and both zoom and focus rockers move the DJI focus
+motor (0–4096). Home / preset 1 (if unset) is gimbal recenter. VISCA and Pelco send an
+explicit stop when the stick is released — that is what zeros speed, not the 250 ms
+WebSocket deadman (closing the web UI will not abort a hardware-controller move).
+
+Point the controller at the bridge's IP, camera address **1**. Pick the matching protocol:
+
+| Controller profile | Transport | Port | Notes |
+|--------------------|-----------|------|--------|
+| Sony VISCA over IP | UDP | 52381 | 8-byte Sony header. RM-IP500, BirdDog, Marshall, SuperJoy "Sony". |
+| VISCA (PTZOptics / generic) | UDP | 1259 | Raw `81 … FF`, no IP header. |
+| VISCA (PTZOptics / generic) | TCP | 5678 | Same raw VISCA on a TCP session. |
+| Pelco-D (or Pelco-P) | TCP and UDP | 4000 | Classic 7-byte D / 8-byte P frames. |
+| Panasonic AW | UDP | 49152 | `#PTS`, `#Z`, `#APC`, `#R` / `#M`, `#O`. AW-RP50/60/150. |
+| PTZOptics HTTP | HTTP GET | 80 | `/cgi-bin/ptzctrl.cgi?ptzcmd&up&12` |
+| Sony CGI | HTTP GET | 80 | `/command/ptzf.cgi?Move=up,24,24` |
+| Panasonic AW HTTP | HTTP GET | 80 | `/cgi-bin/aw_ptz?cmd=#PTS5050&res=1` |
+
+Speed 1–24 (VISCA) / 1–63 (Pelco) / 01–99 (Panasonic, 50 = stop) scales into the **PTZ max
+rate** shown in the web UI (default 30°/s). Invert pan or tilt there if the stick feels
+backwards. Sixteen RAM presets (`CAM_Memory` / Pelco preset / `#M` `#R`) store the current
+attitude until reboot.
+
+ONVIF is not implemented: SOAP + WS-Discovery does not fit the C3, and dedicated PTZ
+hardware almost never speaks it.
+
+## Zoom ramp
 
 `zoom` sets a *target*; firmware advances the commanded position toward it at 20 Hz with a
 trapezoidal profile (`vmax`, `accel`), sending `focus-set` only when the integer position
@@ -194,7 +226,9 @@ Because control now travels over WiFi instead of a wired connection, a dropped c
 must not leave the gimbal spinning at whatever speed it last received. `main.cpp` tracks the
 time of the last `speed` command and **zeroes the gimbal's speed if none arrives within
 250 ms** while a non-zero speed is active (the same `DEADMAN_S = 0.25` as the Python
-session), and also zeroes speed when the last WebSocket client disconnects. If you build a
+session), and also zeroes speed when the last WebSocket client disconnects — **unless a
+hardware PTZ controller currently owns the stick**. VISCA / Pelco / Panasonic send an
+explicit stop on release; if that UDP packet is lost, hit Stop in the web UI. If you build a
 different client than the bundled web UI, make sure it either sends `speed` updates
 continuously while deflected or explicitly sends `stop`/a zero `speed` on release — don't
 rely on a single "fire and forget" command for anything continuous.
@@ -217,9 +251,10 @@ gaps (see `docs/DJI_R_SDK_Protocol.md` §Status for the full list):
 firmware/esp32-gimbal-bridge/
   platformio.ini           PlatformIO env (XIAO C3 + MCP2515 hat)
   src/
-    main.cpp                WiFi/WebSocket/REST glue, safety watchdog
+    main.cpp                WiFi/WebSocket/REST glue, safety watchdog, PTZ sink
     can_hw.h/.cpp           MCP2515 CAN backend for the Seeed hat
     dji_can_protocol.h/.cpp  Packet framing ported from dji_gimbal_cli.py
+    ptz_bridge.h/.cpp        VISCA / Pelco / Panasonic AW / HTTP CGI camera-side
   data/
     index.html               Joystick + telemetry web UI (served via LittleFS)
 ```

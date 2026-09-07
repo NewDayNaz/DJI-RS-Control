@@ -7,6 +7,10 @@
 // - Serves a single-page joystick/telemetry UI from LittleFS at "/".
 // - WebSocket at "/ws": browser -> device JSON commands, device -> browser state at 20 Hz.
 // - REST at "/api/*" mirrors dji_gimbal_web.py (state/speed/position/zoom/command/<name>).
+// - IP PTZ camera protocols so hardware joysticks (Sony RM-IP, PTZOptics SuperJoy,
+//   Panasonic AW-RP, Pelco keyboards) can drive the gimbal: VISCA over IP (UDP 52381),
+//   raw VISCA (UDP 1259 / TCP 5678), Pelco-D/P (UDP+TCP 4000), Panasonic AW (UDP 49152),
+//   plus HTTP CGI (PTZOptics / Sony / AW). See src/ptz_bridge.cpp.
 // - Session behavior mirrors dji_can_session.py:
 //     * startup: enable parameter push, then query the focus motor position
 //     * held speed re-sent at 20 Hz; deadman zeroes speed 250 ms after the last update
@@ -33,6 +37,7 @@
 
 #include "dji_can_protocol.h"
 #include "can_hw.h"
+#include "ptz_bridge.h"
 
 // GIMBAL_SLEEP_ENABLED gates the battery-power-management block below (presence sensing +
 // deep sleep) — see README.md "Power Management". The Seeed CAN hat uses D6–D10 (INT/CS/SPI)
@@ -107,10 +112,21 @@ struct SessionState {
     bool haveZoomReported = false;
     float zoomVmax = ZOOM_VMAX_DEFAULT;
     float zoomAccel = ZOOM_ACCEL_DEFAULT;
+    bool zoomRateActive = false;
+    float zoomRateSigned = 0.0f;
+
+    // Who last took the speed hold. WS uses a 250 ms deadman; PTZ protocols
+    // send an explicit stop (VISCA/Pelco/AW semantics) so they must not be
+    // zeroed just because the browser tab closed.
+    uint8_t ctrlSource = 0; // 0 none, 1 websocket, 2 ptz
 
     // last error surfaced to the UI
     char lastError[96] = "";
 };
+
+static constexpr uint8_t CTRL_NONE = 0;
+static constexpr uint8_t CTRL_WS = 1;
+static constexpr uint8_t CTRL_PTZ = 2;
 static SessionState g_s;
 static SemaphoreHandle_t g_stateLock = nullptr;
 
@@ -299,6 +315,10 @@ static void tickZoom(uint32_t now) {
     float target = g_s.zoomTarget;
     float vmax = g_s.zoomVmax;
     float accel = g_s.zoomAccel;
+    if (g_s.zoomRateActive) {
+        vmax *= fmaxf(0.05f, fabsf(g_s.zoomRateSigned));
+        target = g_s.zoomRateSigned > 0.0f ? ZOOM_MAX : ZOOM_MIN;
+    }
     bool arrived = zoomRampStep(pos, vel, target, vmax, accel, dt);
     pos = fmaxf(ZOOM_MIN, fminf(ZOOM_MAX, pos));
     int commanded = (int) lroundf(pos);
@@ -322,13 +342,14 @@ static void tickZoom(uint32_t now) {
 // Held speed — mirrors hold_speed/release_speed + the SPEED_HZ retransmit loop
 // ---------------------------------------------------------------------------
 
-static void setHeldSpeed(float yaw, float roll, float pitch) {
+static void setHeldSpeed(float yaw, float roll, float pitch, uint8_t source) {
     xSemaphoreTake(g_stateLock, portMAX_DELAY);
     g_s.heldYaw = yaw;
     g_s.heldRoll = roll;
     g_s.heldPitch = pitch;
     g_s.heldAtMs = millis();
     g_s.heldActive = true;
+    g_s.ctrlSource = source;
     xSemaphoreGive(g_stateLock);
 }
 
@@ -337,6 +358,7 @@ static void releaseHeldSpeed() {
     xSemaphoreTake(g_stateLock, portMAX_DELAY);
     g_s.heldActive = false;
     g_s.sentZero = true;
+    g_s.ctrlSource = CTRL_NONE;
     xSemaphoreGive(g_stateLock);
     canSendPacket(dji::buildControlSpeed(0.0f, 0.0f, 0.0f));
 }
@@ -347,10 +369,11 @@ static void tickSpeed(uint32_t now) {
         xSemaphoreGive(g_stateLock);
         return;
     }
-    if (now - g_s.heldAtMs > SPEED_TIMEOUT_MS) {
+    if (g_s.ctrlSource == CTRL_WS && now - g_s.heldAtMs > SPEED_TIMEOUT_MS) {
         // Deadman: WiFi drops must not leave the gimbal spinning.
         g_s.heldActive = false;
         g_s.sentZero = true;
+        g_s.ctrlSource = CTRL_NONE;
         xSemaphoreGive(g_stateLock);
         Serial.println("[safety] speed watchdog: no update in time, zeroed gimbal speed");
         canSendPacket(dji::buildControlSpeed(0.0f, 0.0f, 0.0f));
@@ -394,6 +417,28 @@ static void setZoomTarget(int position) {
     xSemaphoreTake(g_stateLock, portMAX_DELAY);
     g_s.zoomTarget = pos;
     g_s.haveZoomTarget = true;
+    g_s.zoomRateActive = false;
+    xSemaphoreGive(g_stateLock);
+}
+
+static void setZoomRate(float rate) {
+    rate = fmaxf(-1.0f, fminf(1.0f, rate));
+    xSemaphoreTake(g_stateLock, portMAX_DELAY);
+    if (!g_s.haveZoomCmd) {
+        g_s.zoomCmd = 0.0f;
+        g_s.haveZoomCmd = true;
+    }
+    if (fabsf(rate) < 0.02f) {
+        g_s.zoomRateActive = false;
+        g_s.zoomTarget = g_s.zoomCmd;
+        g_s.haveZoomTarget = true;
+        g_s.zoomVel = 0.0f;
+    } else {
+        g_s.zoomRateActive = true;
+        g_s.zoomRateSigned = rate;
+        g_s.zoomTarget = rate > 0.0f ? ZOOM_MAX : ZOOM_MIN;
+        g_s.haveZoomTarget = true;
+    }
     xSemaphoreGive(g_stateLock);
 }
 
@@ -413,6 +458,7 @@ static void motorCalibrate() {
     g_s.haveZoomTarget = false;
     g_s.haveZoomSent = false;
     g_s.haveZoomReported = false;
+    g_s.zoomRateActive = false;
     xSemaphoreGive(g_stateLock);
     canSendPacket(dji::buildMotorCalibrate());
     canSendPacket(dji::buildFocusGet());
@@ -703,9 +749,10 @@ static void canRxTask(void *) {
 // Command handling (shared by WebSocket and REST)
 // ---------------------------------------------------------------------------
 
-static void handleSpeedCommand(float yaw, float roll, float pitch, bool hold) {
+static void handleSpeedCommand(float yaw, float roll, float pitch, bool hold,
+                               uint8_t source = CTRL_WS) {
     if (hold) {
-        setHeldSpeed(yaw, roll, pitch);
+        setHeldSpeed(yaw, roll, pitch, source);
         // Send immediately so the first deflection isn't delayed by the cadence.
         uint32_t now = millis();
         bool moving = fabsf(yaw) > 0.05f || fabsf(roll) > 0.05f || fabsf(pitch) > 0.05f;
@@ -718,6 +765,7 @@ static void handleSpeedCommand(float yaw, float roll, float pitch, bool hold) {
         xSemaphoreTake(g_stateLock, portMAX_DELAY);
         g_s.heldActive = false;
         g_s.sentZero = true;
+        g_s.ctrlSource = CTRL_NONE;
         xSemaphoreGive(g_stateLock);
         canSendPacket(dji::buildControlSpeed(yaw, roll, pitch));
     }
@@ -767,9 +815,15 @@ static void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
         client->text(out);
     } else if (type == WS_EVT_DISCONNECT) {
         Serial.printf("[ws] client #%u disconnected\n", client->id());
-        // If nobody is connected any more, stop driving speed for safety.
+        // If nobody is connected any more, stop driving speed for safety —
+        // but only if the browser was the one holding the stick. A PTZ
+        // joystick must keep moving after the web UI closes.
         if (ws.count() == 0) {
-            releaseHeldSpeed();
+            uint8_t src;
+            xSemaphoreTake(g_stateLock, portMAX_DELAY);
+            src = g_s.ctrlSource;
+            xSemaphoreGive(g_stateLock);
+            if (src == CTRL_WS) releaseHeldSpeed();
         }
     } else if (type == WS_EVT_DATA) {
         AwsFrameInfo *info = (AwsFrameInfo *) arg;
@@ -812,6 +866,7 @@ static void setupRestApi() {
         doc["ip"] = WiFi.localIP().toString();
         doc["ws_clients"] = ws.count();
         fillCanStatusJson(doc["can"].to<JsonObject>());
+        ptzBridgeFillStatus(doc["ptz"].to<JsonObject>());
         String out;
         serializeJson(doc, out);
         req->send(200, "application/json", out);
@@ -882,6 +937,8 @@ static void setupRestApi() {
         serializeJson(doc, out);
         req->send(ok ? 200 : 503, "application/json", out);
     });
+
+    ptzBridgeRegisterHttp(server);
 }
 
 // ---------------------------------------------------------------------------
@@ -943,6 +1000,41 @@ void setup() {
     setupWifi();
     setupCan();
     sessionStart();
+
+    PtzSink ptz = {};
+    ptz.speed = [](float y, float r, float p) {
+        handleSpeedCommand(y, r, p, true, CTRL_PTZ);
+    };
+    ptz.stop = []() { releaseHeldSpeed(); };
+    ptz.position = [](float y, float r, float p, float t) {
+        handlePositionCommand(y, r, p, t);
+    };
+    ptz.zoomAbs = [](int pos) { setZoomTarget(pos); };
+    ptz.zoomRate = [](float rate) { setZoomRate(rate); };
+    ptz.home = []() { execNamedCommand("recenter"); };
+    ptz.sleep = []() { execNamedCommand("sleep"); };
+    ptz.wake = []() { execNamedCommand("wake"); };
+    ptz.recStart = []() { execNamedCommand("rec-start"); };
+    ptz.recStop = []() { execNamedCommand("rec-stop"); };
+    ptz.getAttitude = [](float *y, float *r, float *p) -> bool {
+        xSemaphoreTake(g_stateLock, portMAX_DELAY);
+        bool ok = g_s.haveAngles;
+        if (ok) {
+            *y = g_s.angles.yawDeg;
+            *r = g_s.angles.rollDeg;
+            *p = g_s.angles.pitchDeg;
+        }
+        xSemaphoreGive(g_stateLock);
+        return ok;
+    };
+    ptz.getZoom = [](int *z) -> bool {
+        xSemaphoreTake(g_stateLock, portMAX_DELAY);
+        bool ok = g_s.haveZoomReported;
+        if (ok) *z = g_s.zoomReported;
+        xSemaphoreGive(g_stateLock);
+        return ok;
+    };
+    ptzBridgeBegin(ptz);
 
     ws.onEvent(onWsEvent);
     server.addHandler(&ws);

@@ -201,6 +201,21 @@
         <button id="zoom_get">Zoom get</button>
         <button id="limit">Limits</button>
       </div>
+      <h2 style="margin-top:18px">IP PTZ</h2>
+      <div class="can-diag">
+        <div class="row"><span>Last command</span><span id="ptzLast">—</span></div>
+        <div class="row"><span>From</span><span id="ptzFrom">—</span></div>
+        <div class="row"><span>Counts</span><span id="ptzCounts">—</span></div>
+        <div class="hint" id="ptzPorts"></div>
+        <label class="row" style="margin-top:10px"><span>PTZ max rate</span><span id="ptzRateLabel">30°/s</span></label>
+        <input id="ptzRate" type="range" min="5" max="120" value="30" />
+        <label class="row" style="margin-top:8px; font-size:12px; color:var(--muted)">
+          <span><input type="checkbox" id="ptzInvPan" /> Invert pan</span>
+          <span><input type="checkbox" id="ptzInvTilt" /> Invert tilt</span>
+        </label>
+        <p class="hint">Point a VISCA / Pelco / Panasonic joystick at this IP.
+          Camera address 1. Zoom and focus both drive the gimbal focus motor.</p>
+      </div>
     </section>
   </main>
 
@@ -431,10 +446,56 @@
     $("canHint").textContent = (can.hint || "") + (extra ? "\n" + extra + data : "") + lastTx;
   }
 
+  function renderPtz(ptz) {
+    if (!ptz) return;
+    const last = ptz.last || "—";
+    const age = (typeof ptz.last_age_s === "number") ? `  (${ptz.last_age_s.toFixed(1)}s)` : "";
+    $("ptzLast").textContent = last + age;
+    $("ptzFrom").textContent = ptz.last_from || "—";
+    $("ptzCounts").textContent =
+      `VISCA ${ptz.visca_udp || 0}/${ptz.visca_tcp || 0}  Pelco ${ptz.pelco || 0}` +
+      `  AW ${ptz.panasonic || 0}  CGI ${ptz.cgi || 0}`;
+    const p = ptz.ports || {};
+    $("ptzPorts").textContent =
+      `VISCA UDP ${p.visca_ip_udp || 52381} (Sony IP) / ${p.visca_raw_udp || 1259} (raw)` +
+      `  TCP ${p.visca_raw_tcp || 5678}` +
+      `\nPelco TCP/UDP ${p.pelco || 4000}  Panasonic AW UDP ${p.panasonic_udp || 49152}`;
+    if (document.activeElement !== $("ptzRate") && typeof ptz.max_rate === "number") {
+      $("ptzRate").value = String(Math.round(ptz.max_rate));
+      $("ptzRateLabel").textContent = Math.round(ptz.max_rate) + "°/s";
+    }
+    if (document.activeElement !== $("ptzInvPan")) $("ptzInvPan").checked = !!ptz.invert_pan;
+    if (document.activeElement !== $("ptzInvTilt")) $("ptzInvTilt").checked = !!ptz.invert_tilt;
+  }
+
+  let ptzProfileTimer = null;
+  function postPtzProfile() {
+    $("ptzRateLabel").textContent = $("ptzRate").value + "°/s";
+    clearTimeout(ptzProfileTimer);
+    ptzProfileTimer = setTimeout(async () => {
+      try {
+        await fetch("/api/ptz/profile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            max_rate: Number($("ptzRate").value),
+            invert_pan: $("ptzInvPan").checked,
+            invert_tilt: $("ptzInvTilt").checked,
+          }),
+        });
+      } catch (e) { /* board not up */ }
+    }, 80);
+  }
+  $("ptzRate").addEventListener("input", postPtzProfile);
+  $("ptzInvPan").addEventListener("change", postPtzProfile);
+  $("ptzInvTilt").addEventListener("change", postPtzProfile);
+
   async function pollStatus() {
     try {
       const r = await fetch("/api/status");
-      renderCan((await r.json()).can);
+      const body = await r.json();
+      renderCan(body.can);
+      renderPtz(body.ptz);
     } catch (e) { /* board not up yet */ }
   }
   pollStatus();
