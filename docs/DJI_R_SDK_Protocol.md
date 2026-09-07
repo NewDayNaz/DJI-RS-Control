@@ -1,9 +1,17 @@
 # DJI R SDK Gimbal Protocol (CAN Transport)
 
-This document describes the DJI R SDK external protocol as used by `dji_gimbal_cli.py` to control a DJI RS gimbal over CAN. It applies to RS 2 / RS 2 Pro / RS 3 Pro / RS 4 / RS 4 Pro / RS 5 accessory CAN (including the RSA port, which carries 5 V and CAN on the same connector).
+This document describes the DJI R SDK external protocol used to control a DJI RS gimbal over accessory CAN. It applies to RS 2 / RS 2 Pro / RS 3 Pro / RS 4 / RS 4 Pro / RS 5 (including the RSA port, which carries 5 V and CAN on the same connector).
 
-- **Physical transport**: CAN bus via SLCAN adapter (e.g. SH-C31G / Canable 2.0)
-- **Bitrate**: `1_000_000` bps (1 Mbps)
+Two hosts in this repo speak it:
+
+| Host | Transport | Packet layer | Session |
+|------|-----------|--------------|---------|
+| `dji_gimbal_cli.py` / `dji_can_session.py` | USB CAN adapter (SLCAN / gs_usb, e.g. SH-C31G / Canable 2.0) | `dji_gimbal_cli.py` | CLI waits for matching replies; the session fire-and-forgets |
+| ESP32-C3 bridge (`firmware/esp32-gimbal-bridge`) | Seeed XIAO C3 + XIAO CAN Bus Expansion Board (MCP2515 SPI + SN65HVD230). **Not** the C3’s TWAI pins. | `src/dji_can_protocol.*` (port of the CLI) | `src/main.cpp` (port of `dji_can_session.py`) |
+
+The packet bytes, CRCs, CAN IDs, and command payloads are the same on both. Differences are physical (bit timing, RX filter, termination, how the bus is tapped) and session (the ESP32 never waits for a reply, never sends the user-params poll, and only parses a subset of inbound packets).
+
+- **Bitrate**: `1_000_000` bps (1 Mbps), standard 11-bit IDs
 - **SOF (start-of-frame)**: `0xAA`
 - **Command set (gimbal)**: `0x0E`
 - **Command set (camera record / focus-center)**: `0x0D`
@@ -11,9 +19,9 @@ This document describes the DJI R SDK external protocol as used by `dji_gimbal_c
   - Host → gimbal: `0x223`
   - Gimbal → host: `0x222`
 
-The CLI splits logical SDK packets into CAN frames with up to 8 bytes of data each.
+Hosts split each SDK packet into CAN frames of at most 8 data bytes. Those fragments **must not interleave** with another packet’s fragments on `0x223` (section 4.6).
 
-Encodings in this document were checked against canned SDK packets from a working CAN client. CRC-16 and CRC-32 match `dji_gimbal_cli.py` byte-for-byte when the sequence number matches. Host requests in that client use `CMD_TYPE = 0x03` except for a periodic user-params poll (`CMD_TYPE = 0x02`).
+Encodings were checked against canned SDK packets from a working CAN client. CRC-16 and CRC-32 match `dji_gimbal_cli.py` / `dji_can_protocol.cpp` byte-for-byte when the sequence number matches. Host requests use `CMD_TYPE = 0x03` except for a periodic user-params poll (`CMD_TYPE = 0x02`) that only the CLI can send as a one-shot; the ESP32 and the Python session do not send it.
 
 ---
 
@@ -71,7 +79,10 @@ In the implementation:
   data_len   = len([CMD_SET, CMD_ID] + DATA)
   crc32_len  = 4       # last 4 bytes
   cmd_length = prefix_len + crc16_len + data_len + crc32_len
+             = 18 + len(DATA)
   ```
+
+  Both hosts write byte 2 as `(cmd_length >> 8) & 0xFF`. Every packet they send is shorter than 256 bytes, so byte 2 is `0x00` (no extra flags).
 
 - When parsing a reply:
 
@@ -79,7 +90,9 @@ In the implementation:
   pack_len = packet[1] | ((packet[2] & 0x03) << 8)
   ```
 
-The actual packet length must match `pack_len`, otherwise the packet is rejected.
+  Only the low 2 bits of byte 2 are length. Observed gimbal replies also leave the other bits clear.
+
+The actual packet length must match `pack_len`, otherwise the packet is rejected. `validateSdkReply` also requires `len >= 16` and the reply bit (section 2.2). A reply with a return code and empty payload is 19 bytes (`18 + 1`).
 
 ### 2.2 CMD_TYPE and Reply Bit
 
@@ -91,7 +104,7 @@ Byte 3 carries the command type and some flags:
   CMD_TYPE_REPLY_REQUIRED = 0x03
   ```
 
-- One canned poll uses `CMD_TYPE = 0x02` (user-params, section 16). Treat that as "send, do not wait for a matching reply."
+- One canned poll uses `CMD_TYPE = 0x02` (user-params, section 16). Treat that as "send, do not wait for a matching reply." The ESP32 and `dji_can_session.py` never send `0x02`; they use `0x03` for every request.
 
 - For replies from the gimbal, bit `0x20` must be set; otherwise the packet is not treated as a reply:
 
@@ -103,13 +116,13 @@ Unsolicited "push" packets also have this bit set; they are distinguished by the
 
 ### 2.3 Sequence Number
 
-Bytes 8–9 hold the sequence number in little-endian. The CLI uses a global sequence `_seq`:
+Bytes 8–9 hold the sequence number in little-endian. Both hosts use the same counter (`_seq` / `g_seq`):
 
-- Initialized around `0x2210`.
-- Incremented per packet.
-- When `_seq >= 0xFFFD`, it wraps back to `0x0002`.
+- Starts at `0x2210`.
+- `nextSeq()` increments first, then returns, so the first packet on a boot is `0x2211`.
+- When the counter is `>= 0xFFFD`, it is set to `0x0002` and then incremented (so the wrap produces `0x0003`).
 
-You may treat the sequence as an opaque counter; the gimbal does not appear to enforce strict matching for basic operations.
+You may treat the sequence as an opaque counter. The gimbal does not appear to enforce strict matching for basic operations. The ESP32 session and `dji_can_session.py` never match replies by SEQ; they classify inbound packets by `CMD_SET` / `CMD_ID` only. The CLI’s `request_reply()` matches `CMD_SET` / `CMD_ID` and skips pushes, but still ignores SEQ.
 
 ---
 
@@ -160,7 +173,7 @@ The gimbal/accessory CAN path (RSA port on current RS gimbals, or the 4-pin conn
 
 | Pin | Signal   | Notes                                                                 |
 |-----|----------|------------------------------------------------------------------------|
-| 1   | `VCC_5V` | 5V supplied **by** the gimbal/device. Can potentially power an external adapter/MCU, but the port's current budget is undocumented — don't assume it can carry a WiFi-radio-class load (see `firmware/esp32-gimbal-bridge/README.md`). Never drive a different voltage into this pin. |
+| 1   | `VCC_5V` | 5V supplied **by** the gimbal/device. Never drive a different voltage into this pin. Current budget is unpublished — a Wi‑Fi radio can sag it (Focus Wheel LED goes red). |
 | 2   | `GND`    | Common ground — always connect this regardless of how you power your adapter. |
 | 3   | `CANH`   | CAN bus high                                                            |
 | 4   | `CANL`   | CAN bus low                                                             |
@@ -168,39 +181,87 @@ The gimbal/accessory CAN path (RSA port on current RS gimbals, or the 4-pin conn
 Next to the 4-pin accessory port is a slide switch labeled **`S-BUS` / `CAN`**. It must be set to **`CAN`**
 for this protocol. In the `S-BUS` position the port speaks analog S-BUS/PWM (legacy Ronin-S / SC / 2 joystick control), not the DJI R SDK packet format. If you wire up an adapter and get nothing but silence on `0x222`, check this switch first.
 
-This is the same pinout the SH-C31G/Canable adapter's flying leads were wired to: `CANH`/
-`CANL` to the transceiver's bus pins, `GND` common, `VCC_5V` left unconnected (adapter
-powered separately over USB).
+How this repo actually taps the bus:
 
-### 4.2 CAN IDs and Framing
+- **ESP32-C3 + MCP2515 hat** (the live host): the hat is stacked on the XIAO and wired at the **DJI RS Focus Wheel** 4-pin, which is the same accessory CAN as the gimbal. Pin 1 (`VCC_5V`) goes to the XIAO **`5V`** pad (powers the C3, which then feeds 3V3 to the hat). Pin 2 `GND` common. Pins 3/4 to the hat CANH/CANL screw terminals. Unplug USB while that 5 V rail is connected, or the XIAO backfeeds 5 V onto pin 1.
+- **USB Canable / SH-C31G**: `CANH`/`CANL` to the transceiver, `GND` common, `VCC_5V` left unconnected (adapter powered over USB).
+
+The gimbal end is **not terminated**. The Seeed hat’s 120 Ω is pad **P1** on the back, open by default — short it. Do not add a second resistor at the Focus Wheel plug if P1 is already shorted. Bus-off with no ACK is usually CANH/CANL swapped, missing GND, P1 open, the gimbal unplugged, or the `CAN`/`S-BUS` switch.
+
+Hat SPI (official XIAO CAN Bus Expansion Board; the C3 TWAI pins are unused):
+
+| XIAO pin | GPIO | MCP2515 |
+|----------|------|---------|
+| D6       | 21   | INT     |
+| D7       | 20   | CS      |
+| D8       | 8    | SCK     |
+| D9       | 9    | MISO    |
+| D10      | 10   | MOSI    |
+
+D6/D7 are also UART0. The firmware keeps the console on USB CDC so those pins stay on the MCP2515. Firmware assumes a **16 MHz** MCP2515 crystal (`-DMCP2515_CLOCK_MHZ=16`). An 8 MHz part cannot do 1 Mbps.
+
+### 4.2 Other traffic on the same wire
+
+The Focus Wheel (and other accessories) share this bus. Observed IDs that are **not** DJI R SDK:
+
+| ID | Rate (approx.) | Notes |
+|----|----------------|-------|
+| `0x530` | ~400 Hz | Focus Wheel / accessory. Opaque. |
+| `0x531` | with `0x530` | Same family. |
+| `0x426` | with `0x530` | Same family. |
+
+SDK replies on `0x222` are sparse unless parameter push is on. A host that accepts every ID will spend most of its RX bandwidth on `0x530`. The MCP2515 has **two** RX buffers; those frames will overwrite `0x222` fragments unless filtered in hardware.
+
+The ESP32 default is a hardware filter on `0x222` only (`MASK = 0x7FF`, all six RX filters). Rebuild with `-DCAN_MCP_ACCEPT_ALL=1` to see the other IDs (then `GET /api/status` `can.rx_ids` lists them). Software still ignores anything that is not `0x222` before reassembly. A Canable has a much deeper USB queue, so the Python CLI can get away without a hardware filter.
+
+### 4.3 Bit timing (1 Mbps)
+
+Nominal bitrate is 1 Mbps. Sample point matters on the MCP2515 hat.
+
+autowp’s 16 MHz / `CAN_1000KBPS` preset is 8 TQ, **62.5%** sample, triple-sample (`CNF 00/D0/82`). On this gimbal bus that drove the controller error-passive after a few seconds (TEC climb). The firmware overwrites CNF after `setBitrate`:
+
+| Register | Value | Meaning (16 MHz, BRP = 0 → 8 TQ/bit) |
+|----------|-------|--------------------------------------|
+| CNF1     | `0x40` | SJW = 2, BRP = 0 |
+| CNF2     | `0x98` | BTLMODE = 1, SAM = 0 (single sample), PS1 = 4 TQ, PropSeg = 1 TQ |
+| CNF3     | `0x01` | PS2 = 2 TQ |
+
+Sync (1) + PropSeg (1) + PS1 (4) = sample at **75%**. No triple-sample. This is closer to a typical CANable (~75–80% SP, SAM = 0). USB adapters that already work on the gimbal do not need this tweak; a second MCP2515 host does.
+
+SPI to the MCP2515 is 8 MHz (Fosc/2 for a 16 MHz crystal) so the two RX buffers drain before the next `0x222` fragment.
+
+### 4.4 CAN IDs and Framing
 
 The SDK packet is transported over CAN as follows:
 
 - **Host → gimbal**:
   - Standard 11-bit CAN ID: `0x223`
-  - Data: 0–8 bytes per frame
+  - Data: 1–8 bytes per frame (last fragment may be short; never 0, never > 8)
+  - Not extended (`is_extended_id = false`; firmware masks `id & 0x7FF`)
 - **Gimbal → host**:
   - Standard 11-bit CAN ID: `0x222`
   - Data: 0–8 bytes per frame
 
-The host sends each SDK packet in 8-byte chunks:
+The host sends each SDK packet in 8-byte chunks with **no inter-frame delay** beyond however long the controller takes to ACK:
 
 ```text
 for i in range(0, len(pkt), 8):
     send CAN frame with arbitration_id=0x223 and data=pkt[i : i+8]
 ```
 
-Packets of 19–21 bytes (sleep, wake, record, recenter, AutoTune, ActiveTrack, motor-calib) become three frames: 8 + 8 + remainder. Speed is 25 bytes (four frames, last length 1). Position is 26 bytes (four frames, last length 2).
+Request sizes (`cmd_length = 18 + len(DATA)`):
 
-On reception, the CLI:
+| DATA bytes | Total | Frames | Commands |
+|-----------:|------:|--------|----------|
+| 0 | 18 | 8+8+2 | stiffness, user-params (empty) |
+| 1 | 19 | 8+8+3 | angle, push-enable, ActiveTrack, `cam-cmd`, limits `01` |
+| 2 | 20 | 8+8+4 | recenter/selfie, record / focus-center, focus-get |
+| 3 | 21 | 8+8+5 | sleep/wake, AutoTune, motor-calib, user-params-poll |
+| 5 | 23 | 8+8+7 | focus-set |
+| 7 | 25 | 8+8+8+1 | speed |
+| 8 | 26 | 8+8+8+2 | position |
 
-1. Filters by arbitration ID `0x222`.
-2. Feeds each frame's data to a state-machine reassembler.
-3. Detects `SOF` and length.
-4. Validates CRC-16 and CRC-32.
-5. Emits a complete SDK packet when fully reassembled and valid.
-
-Observed reply / push lengths from a working client (it only starts reassembly for these; the CLI accepts any CRC-valid length):
+Observed reply / push lengths from a working client (it only starts reassembly for these; both of our hosts accept any CRC-valid length):
 
 | Total length | Typical contents |
 |-------------:|------------------|
@@ -209,6 +270,28 @@ Observed reply / push lengths from a working client (it only starts reassembly f
 | 26 (`0x1A`) | Angle reply `0x0E/0x02` |
 | 28 (`0x1C`) | User-params reply `0x0E/0x0B` |
 | 40 (`0x28`) | Parameter push `0x0E/0x08` with extra fields |
+
+### 4.5 Reassembly
+
+Both hosts (`dji_gimbal_cli.py` `reassemble()`, `dji::Reassembler`, `PacketReassembler`) use the same byte state machine on `0x222` payloads only:
+
+1. Wait for `SOF = 0xAA`.
+2. Read length low (byte 1).
+3. Read byte 2; `pack_len = byte1 | ((byte2 & 0x03) << 8)`.
+4. Accumulate until 12 bytes. Verify CRC-16 over bytes 0–9 against bytes 10–11. On mismatch, drop the buffer and return to step 1 (**the current byte is not retried as a new SOF**).
+5. Accumulate until `pack_len`. Verify CRC-32 over `packet[:-4]`. On mismatch, drop. On match, emit the packet.
+
+There is no timeout that abandons a half-packet; a lost fragment leaves the machine in step 4 until a later CRC-32 failure or a later CRC-16 failure after a reset.
+
+`validateSdkReply` then requires the reply bit (`byte3 & 0x20`), matching `pack_len`, and both CRCs again. It does not check SEQ.
+
+### 4.6 Sending constraints
+
+The gimbal reassembles `0x223` the same way: one byte stream. If two SDK packets’ fragments interleave, CAN ACKs still succeed and the gimbal sees garbage (CRC-16 fails, packet dropped).
+
+The ESP32 therefore takes a TX mutex around the whole `for i in range(0, len, 8)` loop. `loop()` (held speed, zoom ramp, angle poll) and HTTP/WebSocket handlers all transmit; without the lock they stomp each other. If a chunk fails, it retries the **entire** SDK packet up to 3 times with 50 ms between attempts. The Python session is single-threaded on the bus, so it does not need a lock.
+
+Do not insert unrelated frames (including the ESP32’s diagnostic `0x100` probe) in the middle of an SDK packet. The probe is a lone `0x100` / `{0xA5}` used only to see whether any peer ACKs; it is not an R SDK frame.
 
 ---
 
@@ -332,10 +415,12 @@ Units and behavior:
   - `1` → pitch is invalid.
   - `0` → pitch is valid.
 
-The CLI currently uses:
+Both hosts currently use:
 
 - Absolute mode (`ctrl` bit 0 set).
 - All axes valid (bits 1–3 cleared).
+
+The packet builder defaults `time` to 0.2 s. The live session / ESP32 WebSocket and REST APIs default `time_s` to **0.4 s** (clamped to 0.0–25.5 s) unless the client sends a value.
 
 ### 7.2 Reply
 
@@ -375,10 +460,17 @@ Units and clamping:
 Control byte:
 
 - Bit 7 set means the host is taking speed control.
-- A working CAN client sends `0x80`. The CLI uses `0x80` (`SPEED_CTRL_TAKEOVER`).
+- A working CAN client sends `0x80`. The CLI, Python session, and ESP32 all send `0x80` (`SPEED_CTRL_TAKEOVER`).
 - Older notes used `0x88` (bit 3 also set). That still builds; pass `ctrl=0x88` if you need to compare.
 
 Pan/tilt from a joystick or on-screen pad is this command, not position (`0x00`). Position is for absolute/incremental moves (presets). On RS 4 / RS 4 Pro / RS 5, axis endpoints set on the gimbal itself are ignored by the SDK speed/position path unless the host is driving in a joystick-style mode that honours the gimbal's own speed, smoothness, and endpoints.
+
+The live session (Python and ESP32) does not fire-and-forget a non-zero speed:
+
+- Held rates are re-sent at **20 Hz** while deflected (threshold 0.05 °/s per axis).
+- A zero-speed packet is sent once when the stick returns to center.
+- **Deadman 250 ms**: if no new hold update arrives (Wi‑Fi drop), send one zero-speed packet. Hardware PTZ on the ESP32 uses an explicit stop instead of this timer.
+- Rates of (0,0,0) are still a valid SDK packet (25 bytes, ctrl `0x80`).
 
 ### 8.2 Reply
 
@@ -425,6 +517,8 @@ The CLI uses this for:
 
 - Continuous streams (`angle`, `joint` commands).
 - One-shot "info" requests.
+
+The ESP32 / Python session only request **attitude** (`DATA = 0x01`), and only as the 20 Hz fallback while parameter push is stale (section 12.2). Joint angles (`0x02`) are CLI-only.
 
 ---
 
@@ -505,6 +599,8 @@ Devices which do not report stiffness may reply with:
 
 - `ret_code == 0x00`, `raw_len == 0`.
 
+The ESP32 has `buildObtainMotorStiffness()` but does not send it (no REST/WS command, no parser).
+
 ---
 
 ## 12. Set Parameter Push – CMD_ID 0x07
@@ -534,6 +630,8 @@ After enabling push, the gimbal will start sending unsolicited packets with:
 - `CMD_ID = 0x08` (gimbal parameter push).
 - `CMD_ID = 0x10` (auto-calibration status).
 
+The ESP32 and `dji_can_session.py` send enable (`DATA = 01`) once at connect, then a focus-get. While no `0x08` push has arrived for **>350 ms** (including before the first one), they poll `Obtain gimbal angle` (`0x0E/0x02`, `DATA = 01`) at 20 Hz. Push-off from the UI stops the unsolicited frames; the stale-poll then takes over until push is enabled again. The CLI `-c listen` enables push and prints; it does not run this fallback.
+
 ---
 
 ## 13. Gimbal Parameter Push – CMD_ID 0x08 (Unsolicited)
@@ -558,7 +656,7 @@ pitch    int16   (0.1°)
 
 Total packet length 25 (`0x19`) is the short form. Length 40 (`0x28`) carries extra fields after the three angles.
 
-The CLI (`-c listen`) decodes flags-then-int16 first. If that does not fit, it falls back to the angle-reply layout (`data_type` + 3×int16 after byte 14).
+The CLI (`-c listen`), `dji_can_session._push_angles()`, and `dji::parsePushAngles()` all decode flags-then-int16 first. If that does not fit, they fall back to the angle-reply layout (`data_type` + 3×int16 after byte 14). The ESP32 applies a successful parse to telemetry (`yaw`/`roll`/`pitch`) and stamps `lastPushMs` so the 350 ms stale poll (section 12.2) backs off.
 
 ---
 
@@ -570,7 +668,7 @@ The CLI (`-c listen`) decodes flags-then-int16 first. If that does not fit, it f
 - **Command ID**: `0x10`
 - **Direction**: gimbal → host (unsolicited)
 
-Payload structure is currently treated as opaque; the CLI just prints:
+Payload structure is currently treated as opaque. The CLI prints:
 
 ```text
 [push] auto calibration status (0x10): ret=0xRR len=NN hex=...
@@ -578,8 +676,10 @@ Payload structure is currently treated as opaque; the CLI just prints:
 
 where:
 
-- `RR` is `ret_code`.
+- `RR` is byte 14 (parsed as `ret_code`, but this is a push).
 - `NN` is payload length.
+
+The ESP32 receives `0x10` (it passes `validateSdkReply`) and then ignores it — not decoded, not surfaced on the WebSocket.
 
 ---
 
@@ -637,8 +737,10 @@ Two encodings are in use:
 1. **Explicit query (CLI `user-params`)**  
    Empty `DATA`, `CMD_TYPE = 0x03`.
 
-2. **Periodic poll (CLI `user-params-poll`)**  
+2. **Periodic poll (CLI `user-params-poll` only)**  
    `CMD_TYPE = 0x02`, `DATA = 00 22 23`. A working client sends this on a ~500 ms cadence (25 ticks of a 20 ms loop) and does not wait for a reply. The three payload bytes look like a dummy byte plus the CAN IDs `0x22` / `0x23`; they have not been decoded further.
+
+The ESP32 has `buildObtainGimbalUserParams()` and `buildObtainGimbalUserParamsPoll()` but **does not call either**. `dji_can_session.py` also never sends `0x0B`. There is no REST/WS command for it.
 
 ### 16.2 Reply Payload
 
@@ -825,6 +927,8 @@ focus_pos = struct.unpack_from("<I", data, len(data) - 4)[0]
 
 Values are typically in the range `0–4096`.
 
+The ESP32 does not send `focus-set` at the WebSocket rate. `zoom` (and PTZ zoom/focus) set a **target**; firmware advances a trapezoidal ramp at 20 Hz (`vmax` default 900 counts/s, `accel` default 1800 counts/s²) and transmits `focus-set` only when the commanded integer position changes. The first `0x12` reply after boot (or after `motor-calib`) seeds the ramp so the motor does not jump. Same algorithm as `zoom_ramp_step()` in `dji_can_session.py`. This ramp is host-side, not part of the gimbal protocol.
+
 ### 21.2 Get Focus Position (`focus-get`)
 
 **Request payload**:
@@ -861,6 +965,8 @@ If decoding fails, the CLI falls back to printing:
 This is the Focus Motor Autocalibration command (lens endpoints). Distinct from gimbal AutoTune (`0x0F`). Total SDK packet length is 21.
 
 CLI: `build_motor_calib()` / `-c motor-calib` (alias `-c focus-02`). The motor runs to both ends of the lens; hold the lens if the gear slips.
+
+The ESP32 `motor-calib` command also clears the zoom-ramp state, then sends this packet and a `focus-get` so the next reply re-seeds the ramp.
 
 ---
 
@@ -912,7 +1018,7 @@ CMD_ID  = 0x01
 DATA    = 01
 ```
 
-Total SDK packet length is 19. A working client sends this next to record-start and treats a reply whose first payload byte is `0x02` as the interesting state. The CLI exposes it as `cam-cmd` and prints that byte.
+Total SDK packet length is 19. A working client sends this next to record-start and treats a reply whose first payload byte is `0x02` as the interesting state. The CLI exposes it as `cam-cmd` and prints that byte. The ESP32 sends the same packet (`{"cmd":"cam-cmd"}` / `POST /api/command/cam-cmd`) and logs `ret` / first payload byte on serial; it does not latch the value into WebSocket state.
 
 ---
 
