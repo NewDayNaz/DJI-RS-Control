@@ -39,6 +39,8 @@ At a high level:
 
 The same packet format is also used for unsolicited "push" messages where the gimbal sends state updates without an explicit request.
 
+The CLI waits for a matching `CMD_SET`/`CMD_ID` reply (skipping pushes). The ESP32 and `dji_can_session.py` transmit and parse inbound packets asynchronously; they never block on a reply.
+
 ---
 
 ## 2. SDK Packet Format
@@ -257,6 +259,7 @@ Request sizes (`cmd_length = 18 + len(DATA)`):
 | 1 | 19 | 8+8+3 | angle, push-enable, ActiveTrack, `cam-cmd`, limits `01` |
 | 2 | 20 | 8+8+4 | recenter/selfie, record / focus-center, focus-get |
 | 3 | 21 | 8+8+5 | sleep/wake, AutoTune, motor-calib, user-params-poll |
+| 4 | 22 | 8+8+6 | module version (`device_id`) |
 | 5 | 23 | 8+8+7 | focus-set |
 | 7 | 25 | 8+8+8+1 | speed |
 | 8 | 26 | 8+8+8+2 | position |
@@ -336,13 +339,13 @@ Most of the CLI commands treat `ret_code == 0x00` as success and display additio
 
 ## 6. Gimbal Command Set 0x0E
 
-Gimbal motion, telemetry, and sleep/wake in the CLI use:
+Gimbal motion, telemetry, and sleep/wake in both hosts use:
 
 - `CMD_SET = 0x0E`
 
 Camera record and Ronin focus-center use `CMD_SET = 0x0D` (section 22). Those are a different command set, not extra `0x0E` cmd_ids.
 
-The sections below document each observed command (CMD_ID) and payload.
+The sections below document each observed command (CMD_ID) and payload. Which host actually sends or parses each one is in section 23.4 / §25.
 
 ### 6.1 Summary of Command IDs
 
@@ -572,7 +575,7 @@ All int16 values are scaled by 0.1 when presented in degrees.
 
 3. **6 bytes after `ret_code`** (25-byte packet). A working client stores these six bytes as the endpoint snapshot and does not parse 6×int16. The CLI prints that compact payload as hex when it sees it.
 
-If decoding fails but `ret_code == 0x00`, the CLI prints the raw payload length and hex.
+If decoding fails but `ret_code == 0x00`, the CLI prints the raw payload length and hex. The ESP32 `parseLimitAngles()` accepts only the 12-byte and 13-byte shapes (preferring the 13-byte layout so the query byte is not read as `yaw_min`). The 6-byte compact snapshot is not parsed into `state.limits`.
 
 ---
 
@@ -1024,17 +1027,15 @@ Total SDK packet length is 19. A working client sends this next to record-start 
 
 ## 23. High-Level Interaction Patterns
 
-The CLI (`dji_gimbal_cli.py`) demonstrates several typical flows:
-
-### 23.1 Continuous Angle Streaming
+### 23.1 Continuous Angle Streaming (CLI)
 
 - `angle`:
   - Repeatedly sends `CMD_SET = 0x0E`, `CMD_ID = 0x02`, `DATA = [0x01]` (attitude angles).
   - Parses yaw/roll/pitch and prints them at a given interval.
 - `joint`:
-  - Same, but `DATA = [0x02]` (joint angles).
+  - Same, but `DATA = [0x02]` (joint angles). CLI-only; the ESP32 never requests joint.
 
-### 23.2 One-Shot Info Query
+### 23.2 One-Shot Info Query (CLI)
 
 The `info` command performs a sequence:
 
@@ -1043,9 +1044,9 @@ The `info` command performs a sequence:
 3. Obtain gimbal limit angles (`0x04`, DATA `01`).
 4. Obtain motor stiffness (`0x06`).
 
-All results are printed in a human-readable format for quick diagnostics.
+All results are printed in a human-readable format for quick diagnostics. The ESP32 exposes `version` and `limit` as named commands; it has no `info` or `stiffness` endpoint.
 
-### 23.3 Push-Based Telemetry
+### 23.3 Push-Based Telemetry (CLI)
 
 - `push-on`:
   - Sends `CMD_SET = 0x0E`, `CMD_ID = 0x07`, `DATA = [0x01]`.
@@ -1056,7 +1057,7 @@ All results are printed in a human-readable format for quick diagnostics.
   - Reassembles SDK packets.
   - Prints `0x08` pushes (25-byte and 40-byte), `0x10` AutoTune status, and `0x0D/0x01` camera replies.
 
-### 23.4 One-shot motion, camera, and motor commands
+### 23.4 One-shot motion, camera, and motor commands (CLI)
 
 These one-shot commands print the TX encoding, then the `0x222` reply as `cmd_set`, `cmd_id`, `ret_code`, and payload hex. They execute if the gimbal accepts them.
 
@@ -1073,24 +1074,65 @@ python dji_gimbal_cli.py COM6 -c cam-cmd
 python dji_gimbal_cli.py COM6 -c activetrack
 ```
 
-| CLI | CMD_SET | CMD_ID | DATA | CMD_TYPE |
-|-----|---------|--------|------|----------|
-| `sleep` | `0x0E` | `0x0C` | `23 01 01` | `0x03` |
-| `wake` | `0x0E` | `0x0C` | `23 01 00` | `0x03` |
-| `calibrate` / `autotune` | `0x0E` | `0x0F` | `00 01 01` | `0x03` |
-| `recenter` | `0x0E` | `0x0E` | `FE 01` | `0x03` |
-| `activetrack` | `0x0E` | `0x11` | `03` | `0x03` |
-| `limit` | `0x0E` | `0x04` | `01` | `0x03` |
-| `user-params-poll` | `0x0E` | `0x0B` | `00 22 23` | `0x02` |
-| `motor-calib` | `0x0E` | `0x12` | `02 00 01` | `0x03` |
-| `speed` | `0x0E` | `0x01` | 3×int16 + `80` | `0x03` |
-| `rec-start` | `0x0D` | `0x00` | `03 00` | `0x03` |
-| `rec-stop` | `0x0D` | `0x00` | `04 00` | `0x03` |
-| `focus-center-start` | `0x0D` | `0x00` | `05 00` | `0x03` |
-| `focus-center-stop` | `0x0D` | `0x00` | `0B 00` | `0x03` |
-| `cam-cmd` | `0x0D` | `0x01` | `01` | `0x03` |
+| Command | CMD_SET | CMD_ID | DATA | CMD_TYPE | CLI | ESP32 |
+|---------|---------|--------|------|----------|:---:|:-----:|
+| `sleep` | `0x0E` | `0x0C` | `23 01 01` | `0x03` | yes | yes |
+| `wake` | `0x0E` | `0x0C` | `23 01 00` | `0x03` | yes | yes |
+| `calibrate` / `autotune` | `0x0E` | `0x0F` | `00 01 01` | `0x03` | yes | yes |
+| `recenter` | `0x0E` | `0x0E` | `FE 01` | `0x03` | yes | yes |
+| `selfie` | `0x0E` | `0x0E` | `FE 02` | `0x03` | yes | yes |
+| `activetrack` | `0x0E` | `0x11` | `03` | `0x03` | yes | yes |
+| `limit` | `0x0E` | `0x04` | `01` | `0x03` | yes | yes |
+| `version` | `0x0E` | `0x09` | device_id `01 00 00 00` | `0x03` | yes | yes |
+| `user-params` | `0x0E` | `0x0B` | (empty) | `0x03` | yes | builder only |
+| `user-params-poll` | `0x0E` | `0x0B` | `00 22 23` | `0x02` | yes | builder only |
+| `stiffness` | `0x0E` | `0x06` | (empty) | `0x03` | yes | builder only |
+| `motor-calib` | `0x0E` | `0x12` | `02 00 01` | `0x03` | yes | yes |
+| `speed` | `0x0E` | `0x01` | 3×int16 + `80` | `0x03` | yes | yes (held 20 Hz) |
+| `position` | `0x0E` | `0x00` | 3×int16 + ctrl + time | `0x03` | yes | yes |
+| `zoom_get` / `focus-get` | `0x0E` | `0x12` | `15 00` | `0x03` | yes | yes |
+| `focus-set` / `zoom` | `0x0E` | `0x12` | `01 00 02` + uint16 | `0x03` | yes | yes (ramped) |
+| `push-on` / `push-off` | `0x0E` | `0x07` | `01` / `00` | `0x03` | yes | yes |
+| `rec-start` | `0x0D` | `0x00` | `03 00` | `0x03` | yes | yes |
+| `rec-stop` | `0x0D` | `0x00` | `04 00` | `0x03` | yes | yes |
+| `focus-center-start` | `0x0D` | `0x00` | `05 00` | `0x03` | yes | yes |
+| `focus-center-stop` | `0x0D` | `0x00` | `0B 00` | `0x03` | yes | yes |
+| `cam-cmd` | `0x0D` | `0x01` | `01` | `0x03` | yes | yes (serial only) |
 
 Sleep, wake, record, center-focus, recenter, ActiveTrack, and motor-calib match canned packets (CRC included, once SEQ is aligned). AutoTune, limits `01`, `cam-cmd`, speed ctrl `0x80`, and the user-params poll come from the same client. `focus-02` is an alias for `motor-calib`. `zoom-set` is an alias for `focus-set`.
+
+### 23.5 ESP32 / Python session (live control)
+
+`dji_can_session.py` and `firmware/esp32-gimbal-bridge/src/main.cpp` share this loop. They do **not** wait for replies.
+
+On connect:
+
+1. `0x0E/0x07` enable parameter push.
+2. `0x0E/0x12` `15 00` (focus-get) so the zoom ramp can seed from the motor.
+
+Every tick:
+
+| Period | Action |
+|--------|--------|
+| 50 ms (20 Hz) | Re-send held speed while any axis is > 0.05 °/s; send one zero-speed when it returns to center |
+| 250 ms silence | Deadman: one zero-speed (WebSocket path only on the ESP32; PTZ uses explicit stop) |
+| 50 ms | Zoom ramp step; `focus-set` only if the integer position changed |
+| 50 ms, and last `0x08` push older than 350 ms | Poll attitude `0x0E/0x02` `01` |
+
+Inbound `0x222` handling on the ESP32 after CRC validation:
+
+| CMD | Action |
+|-----|--------|
+| `0x0E/0x08` | `parsePushAngles` → telemetry; stamp push time |
+| `0x0E/0x02` | `parseGimbalAngles` → telemetry (poll fallback) |
+| `0x0E/0x12` | `parseFocusPosition` → seed zoom ramp (first reply only) |
+| `0x0E/0x09` | `parseModuleVersion` → `state.version` |
+| `0x0E/0x04` | `parseLimitAngles` (12- or 13-byte payload) → `state.limits` |
+| `0x0D/0x01` | log first payload byte on serial |
+| `0x0E/0x10` | received, ignored |
+| anything else | dropped (including speed/position/sleep acks) |
+
+The 6-byte compact limits shape is not parsed on the ESP32 (`parseLimitAngles` returns false).
 
 ---
 
@@ -1098,30 +1140,59 @@ Sleep, wake, record, center-focus, recenter, ActiveTrack, and motor-calib match 
 
 To implement your own client in another language or environment:
 
-1. **Open CAN at 1 Mbps**:
+1. **Open CAN at 1 Mbps**, standard 11-bit:
    - Send frames with ID `0x223`, receive frames with ID `0x222`.
+   - On an MCP2515 (two RX buffers), hardware-filter to `0x222`. The same wire runs ~400 Hz of Focus Wheel frames on `0x530` / `0x531` / `0x426` (section 4.2).
+   - On an MCP2515 at 16 MHz, do not use autowp’s 62.5% / triple-sample 1 Mbps preset; use 75% sample, SAM = 0, SJW = 2 (section 4.3). Short the 120 Ω terminator; the gimbal is not terminated.
 2. **Build SDK packets**:
    - Start with `SOF = 0xAA`.
-   - Set `LEN` to total packet length.
+   - Set `LEN` to total packet length (`18 + len(DATA)`).
    - Set `CMD_TYPE` to `0x03` (reply required) for requests.
    - Set `ENC = 0x00`, `RES = 0x00 0x00 0x00`.
-   - Fill `SEQ` with an incrementing little-endian counter.
+   - Fill `SEQ` with an incrementing little-endian counter (section 2.3).
    - Append CRC-16 over bytes 0–9.
    - Append `CMD_SET`, `CMD_ID`, and command-specific `DATA`.
    - Append CRC-32 over bytes 0..N-5.
 3. **Fragment into CAN frames**:
-   - Slice packet into 8-byte chunks and send sequentially on ID `0x223`.
+   - Slice the packet into 8-byte chunks and send sequentially on ID `0x223` **without interleaving another packet** (section 4.6). A TX mutex is required if more than one task transmits.
 4. **Receive and reassemble**:
-   - On ID `0x222`, feed bytes into a state machine:
-     - Wait for `SOF = 0xAA`.
-     - Read length low/high, compute total length.
-     - Validate CRC-16 and CRC-32.
-   - Treat packets with `(byte3 & 0x20) != 0` as replies or pushes.
+   - On ID `0x222`, feed bytes into the state machine in section 4.5 (CRC-16 check at 12 bytes, then CRC-32 at `pack_len`).
+   - Treat packets with `(byte3 & 0x20) != 0` as replies or pushes. Do not require SEQ match.
 5. **Decode commands**:
    - Use `CMD_SET` and `CMD_ID` as documented above (`0x0E` gimbal, `0x0D` camera-control cable).
    - Parse payloads according to the sections in this document.
+   - Enable parameter push (`0x07`/`01`) if you want `0x08` telemetry; otherwise poll `0x02`.
 6. **Handle return codes**:
-   - Use `ret_code` to classify success vs. parse/execute/undefined errors.
+   - Use `ret_code` to classify success vs. parse/execute/undefined errors. Unsolicited `0x08` uses byte 14 as flags, not a return code.
+7. **If you drive speed over a lossy link** (Wi‑Fi):
+   - Retransmit non-zero `0x01` at ~20 Hz and send a zero-speed packet on release or after ~250 ms of silence. Do not rely on a single fire-and-forget speed frame.
 
-This document, together with the `dji_gimbal_cli.py` implementation, should provide a complete reference for controlling the DJI RS gimbal over CAN using the DJI R SDK packet format.
+Reference implementations: `dji_gimbal_cli.py` (framing), `dji_can_session.py` (session), `firmware/esp32-gimbal-bridge/src/dji_can_protocol.cpp` and `src/can_hw.cpp` (same framing on MCP2515).
+
+---
+
+## 25. Status and known gaps
+
+What this repo has actually run on the bus vs. what is only built or only observed.
+
+| Item | Evidence | Status |
+|------|----------|--------|
+| Packet framing, CRC-16/CRC-32, `0x223`/`0x222`, 8-byte fragments | CLI + ESP32 byte-identical builders | Done |
+| Speed `0x01` ctrl `0x80`, position `0x00` absolute, recenter `FE 01`, sleep/wake, record, focus-center, motor-calib, ActiveTrack | Match canned TX (CRC included, SEQ aligned) | Done |
+| Parameter push enable + `0x08` angle parse (25- and 40-byte) | Session + ESP32 | Done |
+| Angle poll `0x02` attitude fallback | Session + ESP32 | Done |
+| Focus get/set `0x12`, zoom ramp | Session + ESP32 | Done |
+| Module version `0x09`, limits `0x04` (12- or 13-byte) | CLI + ESP32 named commands | Done |
+| MCP2515 1 Mbps at 75% sample, `0x222` hardware filter, P1 terminator, Focus Wheel tap | `can_hw.cpp` | Done |
+| Selfie `FE 02` | Built and sent; not in the canned TX list | Sent, less evidence |
+| AutoTune `0x0F` | Canned TX + CLI/ESP32 command | Sent |
+| AutoTune status push `0x10` | Received; CLI hex-dumps; ESP32 ignores | Opaque |
+| Stiffness `0x06` | CLI one-shot; ESP32 builder unused | Opaque payload |
+| User-params `0x0B` (empty and `00 22 23` poll) | CLI one-shot; ESP32 builder unused; session never sends | Opaque payload |
+| Compact 6-byte limits reply | Working client snapshot; CLI hex; ESP32 does not parse | Partial |
+| Focus Wheel IDs `0x530`/`0x531`/`0x426` | Observed ~400 Hz; not R SDK | Not decoded |
+| CMD_IDs other than the table in section 6.1 | — | Unknown |
+
+If you change framing or a command payload in one host, check the other (`dji_gimbal_cli.py` ↔ `dji_can_protocol.cpp`, `dji_can_session.py` ↔ `main.cpp`).
+
 
