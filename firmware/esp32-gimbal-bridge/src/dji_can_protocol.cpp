@@ -162,12 +162,43 @@ std::vector<uint8_t> buildObtainGimbalAngle(uint8_t dataTypeByte) {
     return buildSdkPacket(CMD_SET_GIMBAL, CMD_ID_ANGLE, d, 1);
 }
 
+std::vector<uint8_t> buildObtainModuleVersion(uint32_t deviceId) {
+    uint8_t d[4];
+    memcpy(d, &deviceId, 4);
+    return buildSdkPacket(CMD_SET_GIMBAL, CMD_ID_MODULE_VERSION, d, sizeof(d));
+}
+
+std::vector<uint8_t> buildObtainGimbalLimitAngle(uint8_t query) {
+    // A working CAN client sends DATA 01; empty DATA is also accepted by some devices.
+    uint8_t d[1] = {query};
+    return buildSdkPacket(CMD_SET_GIMBAL, CMD_ID_LIMIT_ANGLE, d, 1);
+}
+
+std::vector<uint8_t> buildObtainMotorStiffness() {
+    return buildSdkPacket(CMD_SET_GIMBAL, CMD_ID_STIFFNESS, nullptr, 0);
+}
+
+std::vector<uint8_t> buildObtainGimbalUserParams() {
+    return buildSdkPacket(CMD_SET_GIMBAL, CMD_ID_USER_PARAMS, nullptr, 0);
+}
+
+std::vector<uint8_t> buildObtainGimbalUserParamsPoll() {
+    // Periodic user-params poll used by a working CAN client: CMD_TYPE 0x02 (not
+    // reply-required), DATA 00 22 23.
+    uint8_t d[3] = {0x00, 0x22, 0x23};
+    return buildSdkPacket(CMD_SET_GIMBAL, CMD_ID_USER_PARAMS, d, sizeof(d), 0x02);
+}
+
 std::vector<uint8_t> buildControlPosition(float yawDeg, float rollDeg, float pitchDeg,
-                                           bool absolute, float timeS) {
+                                           bool absolute, float timeS,
+                                           bool yawValid, bool rollValid, bool pitchValid) {
     int16_t yaw = (int16_t) lroundf(yawDeg * 10.0f);
     int16_t roll = (int16_t) lroundf(rollDeg * 10.0f);
     int16_t pitch = (int16_t) lroundf(pitchDeg * 10.0f);
     uint8_t ctrl = absolute ? 0x01 : 0x00;
+    if (!yawValid) ctrl |= 0x02;
+    if (!rollValid) ctrl |= 0x04;
+    if (!pitchValid) ctrl |= 0x08;
     uint8_t timeByte = (uint8_t) constrain((int) lroundf(timeS * 10.0f), 0, 255);
 
     uint8_t d[8];
@@ -179,7 +210,8 @@ std::vector<uint8_t> buildControlPosition(float yawDeg, float rollDeg, float pit
     return buildSdkPacket(CMD_SET_GIMBAL, CMD_ID_POSITION, d, sizeof(d));
 }
 
-std::vector<uint8_t> buildControlSpeed(float yawDegPerS, float rollDegPerS, float pitchDegPerS) {
+std::vector<uint8_t> buildControlSpeed(float yawDegPerS, float rollDegPerS, float pitchDegPerS,
+                                        uint8_t ctrl) {
     int16_t yaw = (int16_t) constrain((int) lroundf(yawDegPerS * 10.0f), -3600, 3600);
     int16_t roll = (int16_t) constrain((int) lroundf(rollDegPerS * 10.0f), -3600, 3600);
     int16_t pitch = (int16_t) constrain((int) lroundf(pitchDegPerS * 10.0f), -3600, 3600);
@@ -188,7 +220,7 @@ std::vector<uint8_t> buildControlSpeed(float yawDegPerS, float rollDegPerS, floa
     memcpy(&d[0], &yaw, 2);
     memcpy(&d[2], &roll, 2);
     memcpy(&d[4], &pitch, 2);
-    d[6] = 0x88; // "take over speed control"
+    d[6] = ctrl;
     return buildSdkPacket(CMD_SET_GIMBAL, CMD_ID_SPEED, d, sizeof(d));
 }
 
@@ -207,11 +239,58 @@ std::vector<uint8_t> buildSetParameterPush(bool enable) {
     return buildSdkPacket(CMD_SET_GIMBAL, CMD_ID_PUSH_ENABLE, d, sizeof(d));
 }
 
-std::vector<uint8_t> buildFocusSet(uint16_t position) {
+std::vector<uint8_t> buildSleep() {
+    uint8_t d[3] = {0x23, 0x01, 0x01};
+    return buildSdkPacket(CMD_SET_GIMBAL, CMD_ID_SLEEP_WAKE, d, sizeof(d));
+}
+
+std::vector<uint8_t> buildWake() {
+    uint8_t d[3] = {0x23, 0x01, 0x00};
+    return buildSdkPacket(CMD_SET_GIMBAL, CMD_ID_SLEEP_WAKE, d, sizeof(d));
+}
+
+std::vector<uint8_t> buildCalibrate() {
+    uint8_t d[3] = {0x00, 0x01, 0x01};
+    return buildSdkPacket(CMD_SET_GIMBAL, CMD_ID_AUTOTUNE, d, sizeof(d));
+}
+
+std::vector<uint8_t> buildMotorCalibrate() {
+    // Focus-motor autocalibration: finds lens endpoints; required before zoom/focus-set.
+    uint8_t d[3] = {0x02, 0x00, 0x01};
+    return buildSdkPacket(CMD_SET_GIMBAL, CMD_ID_FOCUS, d, sizeof(d));
+}
+
+std::vector<uint8_t> buildRecordStart() {
+    uint8_t d[2] = {0x03, 0x00};
+    return buildSdkPacket(CMD_SET_CAMERA, CMD_ID_CAMERA_CTRL, d, sizeof(d));
+}
+
+std::vector<uint8_t> buildRecordStop() {
+    uint8_t d[2] = {0x04, 0x00};
+    return buildSdkPacket(CMD_SET_CAMERA, CMD_ID_CAMERA_CTRL, d, sizeof(d));
+}
+
+std::vector<uint8_t> buildFocusCenterStart() {
+    uint8_t d[2] = {0x05, 0x00};
+    return buildSdkPacket(CMD_SET_CAMERA, CMD_ID_CAMERA_CTRL, d, sizeof(d));
+}
+
+std::vector<uint8_t> buildFocusCenterStop() {
+    uint8_t d[2] = {0x0B, 0x00};
+    return buildSdkPacket(CMD_SET_CAMERA, CMD_ID_CAMERA_CTRL, d, sizeof(d));
+}
+
+std::vector<uint8_t> buildCameraCmd() {
+    uint8_t d[1] = {0x01};
+    return buildSdkPacket(CMD_SET_CAMERA, CMD_ID_CAMERA_CMD, d, sizeof(d));
+}
+
+std::vector<uint8_t> buildFocusSet(uint16_t position, uint8_t cmdSubId,
+                                    uint8_t ctlType, uint8_t dataLength) {
     uint8_t d[5];
-    d[0] = 0x01; // cmd_sub_id
-    d[1] = 0x00; // ctl_type
-    d[2] = 0x02; // data_len
+    d[0] = cmdSubId;
+    d[1] = ctlType;
+    d[2] = dataLength;
     memcpy(&d[3], &position, 2);
     return buildSdkPacket(CMD_SET_GIMBAL, CMD_ID_FOCUS, d, sizeof(d));
 }
@@ -241,17 +320,34 @@ bool validateSdkReply(const uint8_t *packet, size_t len, SdkReply &out) {
     return true;
 }
 
-bool parseGimbalAngles(const SdkReply &reply, GimbalAngles &out) {
-    if (reply.retCode != RET_SUCCESS) return false;
-    if (reply.dataLen < 7) return false; // data_type(1) + yaw(2) + roll(2) + pitch(2)
+static bool anglesFromInt16s(const uint8_t *blob, size_t len, size_t offset, GimbalAngles &out) {
+    if (offset + 6 > len) return false;
     int16_t yaw, roll, pitch;
-    memcpy(&yaw, reply.data + 1, 2);
-    memcpy(&roll, reply.data + 3, 2);
-    memcpy(&pitch, reply.data + 5, 2);
+    memcpy(&yaw, blob + offset, 2);
+    memcpy(&roll, blob + offset + 2, 2);
+    memcpy(&pitch, blob + offset + 4, 2);
     out.yawDeg = yaw * 0.1f;
     out.rollDeg = roll * 0.1f;
     out.pitchDeg = pitch * 0.1f;
     return true;
+}
+
+bool parseGimbalAngles(const SdkReply &reply, GimbalAngles &out) {
+    if (reply.retCode != RET_SUCCESS) return false;
+    // data = data_type(1), yaw(2), roll(2), pitch(2)
+    return anglesFromInt16s(reply.data, reply.dataLen, 1, out);
+}
+
+bool parsePushAngles(const SdkReply &reply, GimbalAngles &out) {
+    // Byte 14 is flags on unsolicited push (bit 0 = angles present), then 3 x int16.
+    // Some 26-byte pushes use the angle-reply layout (data_type + 3 x int16) instead.
+    if ((reply.retCode & 0x01) && reply.dataLen >= 6) {
+        if (anglesFromInt16s(reply.data, reply.dataLen, 0, out)) return true;
+    }
+    if (reply.dataLen >= 7) {
+        return anglesFromInt16s(reply.data, reply.dataLen, 1, out);
+    }
+    return false;
 }
 
 bool parseFocusPosition(const SdkReply &reply, uint32_t &position) {
@@ -259,6 +355,57 @@ bool parseFocusPosition(const SdkReply &reply, uint32_t &position) {
     if (reply.dataLen < 4) return false;
     memcpy(&position, reply.data + reply.dataLen - 4, 4);
     return true;
+}
+
+bool parseModuleVersion(const SdkReply &reply, uint32_t &deviceId, uint32_t &versionUint) {
+    if (reply.retCode != RET_SUCCESS) return false;
+    if (reply.dataLen < 8) return false;
+    memcpy(&deviceId, reply.data, 4);
+    memcpy(&versionUint, reply.data + 4, 4);
+    return true;
+}
+
+void formatModuleVersion(uint32_t versionUint, char *out, size_t outLen) {
+    snprintf(out, outLen, "%lX.%02lX.%02lX.%02lX",
+             (unsigned long) ((versionUint >> 24) & 0xFF),
+             (unsigned long) ((versionUint >> 16) & 0xFF),
+             (unsigned long) ((versionUint >> 8) & 0xFF),
+             (unsigned long) (versionUint & 0xFF));
+}
+
+bool parseLimitAngles(const SdkReply &reply, GimbalLimits &out) {
+    if (reply.retCode != RET_SUCCESS) return false;
+    // Bare: 6 x int16 (12 bytes). Prefixed: query byte + 6 x int16 (13 bytes) — prefer
+    // the prefixed layout at 13 so the query byte is not read as yaw_min.
+    size_t offset;
+    if (reply.dataLen == 13) {
+        offset = 1;
+    } else if (reply.dataLen >= 12) {
+        offset = 0;
+    } else {
+        return false;
+    }
+    int16_t v[6];
+    for (int i = 0; i < 6; i++) {
+        memcpy(&v[i], reply.data + offset + i * 2, 2);
+    }
+    out.yawMin = v[0] * 0.1f;
+    out.yawMax = v[1] * 0.1f;
+    out.rollMin = v[2] * 0.1f;
+    out.rollMax = v[3] * 0.1f;
+    out.pitchMin = v[4] * 0.1f;
+    out.pitchMax = v[5] * 0.1f;
+    return true;
+}
+
+const char *returnCodeStr(uint8_t code) {
+    switch (code) {
+        case RET_SUCCESS: return "success";
+        case RET_PARSE_ERROR: return "command parse error";
+        case RET_EXEC_FAIL: return "command execution failed";
+        case RET_UNDEFINED: return "undefined error";
+        default: return "unknown";
+    }
 }
 
 // ---- Reassembler (mirrors reassemble() in dji_gimbal_cli.py) ----

@@ -5,9 +5,17 @@ Battery-powered ESP32 firmware that speaks the DJI R SDK CAN protocol (documente
 via [`dji_gimbal_cli.py`](../../dji_gimbal_cli.py) over a wired SH-C31G/Canable adapter) and
 exposes it as a phone/browser-friendly WebSocket + REST API with a built-in joystick web UI.
 
-This firmware is a straight port of the packet framing, CRC-16/CRC-32, and command builders
-from `dji_gimbal_cli.py` — see [`src/dji_can_protocol.h`](src/dji_can_protocol.h)/`.cpp`. If you
-change something there, check whether the Python CLI needs the same fix (and vice versa).
+This firmware tracks the **golden Python implementation** as its standard:
+
+- [`src/dji_can_protocol.h`](src/dji_can_protocol.h)/`.cpp` ports the packet framing,
+  CRC-16/CRC-32, builders, and parsers from `dji_gimbal_cli.py` (gimbal CmdSet `0x0E`
+  and camera CmdSet `0x0D`).
+- `src/main.cpp` ports the session behavior of `dji_can_session.py` (startup push-enable +
+  focus-position query, 20 Hz held-speed with a 250 ms deadman, 20 Hz angle polling while
+  parameter push is stale >350 ms, and a 20 Hz trapezoidal zoom ramp with configurable
+  vmax/accel) and the API surface of `dji_gimbal_web.py`.
+
+If you change behavior in one implementation, check whether the other needs the same fix.
 
 ## Hardware
 
@@ -54,7 +62,11 @@ carries a second protocol at ~400 Hz (`0x530` / `0x531` / `0x426`). The MCP2515 
 RX buffers, so letting that flood through would drop SDK frames. For debug, rebuild with
 `-DCAN_MCP_ACCEPT_ALL=1`.
 
-Do not auto-spam push-enable. Turn telemetry on from the UI when you want `0x222`.
+**Push telemetry.** At boot the firmware sends `Set parameter push (0x0E/0x07) enable`
+once and queries the focus motor position, matching the golden session's connect
+sequence. While push frames stop arriving for >350 ms, it falls back to polling
+`Obtain gimbal angle` at 20 Hz (same as the Python session). Toggle push from the UI
+(Telemetry section) if you want the bus quiet.
 
 ## Power Management
 
@@ -146,53 +158,94 @@ the bootloader. If `pio run -t upload` can't find/flash the board, hold `BOOT`, 
 
 ## Control surface
 
+The API mirrors `dji_gimbal_web.py`. Command names are identical to the Python web
+server's `/api/command/<name>` allow-list.
+
 ### WebSocket (`ws://<device-ip>/ws`) — use this for continuous/real-time control
 
 Browser → device, JSON text frames:
 
-| `cmd`         | Fields                          | Notes                                                   |
-|---------------|----------------------------------|----------------------------------------------------------|
-| `speed`       | `yaw`, `roll`, `pitch` (°/s)     | Send at ~20 Hz while the joystick is deflected; the UI already does this. |
-| `recenter`    | —                                | One-shot recenter.                                        |
-| `selfie`      | —                                | One-shot selfie pose.                                      |
-| `activetrack` | —                                | Toggles ActiveTrack.                                        |
-| `focus`       | `position` (0–4096)              | Absolute focus motor position.                              |
-| `push`        | `enable` (bool)                  | Enable/disable telemetry push from the gimbal.               |
+| `cmd`          | Fields                              | Notes                                                        |
+|----------------|--------------------------------------|---------------------------------------------------------------|
+| `speed`        | `yaw`, `roll`, `pitch` (°/s), `hold` | `hold:true` re-sends at 20 Hz until released; send at ~20 Hz while deflected (the UI does). `hold:false` fires once. |
+| `position`     | `yaw`, `roll`, `pitch` (°), `time_s` | Absolute go-to (CmdSet `0x0E` CmdID `0x00`).                   |
+| `zoom`         | `position` (0–4096)                  | Focus-motor target; the device ramps to it (see below).        |
+| `zoom_profile` | `vmax` (50–8000 /s), `accel` (50–40000 /s²) | Ramp tuning for `zoom`.                               |
+| `<name>`       | —                                    | Any named command below.                                       |
 
-Device → browser: `{"type":"telemetry","yaw":..,"roll":..,"pitch":..,"rssi":..}` at ~10 Hz
-whenever the gimbal is pushing angle data.
+Named commands (same strings over WS `{"cmd": name}` and REST `POST /api/command/<name>`):
 
-### REST (`/api/*`) — one-shot commands, no persistent connection needed
+| Name                 | Protocol                         | Effect                                   |
+|----------------------|-----------------------------------|-------------------------------------------|
+| `sleep` / `wake`     | `0x0E/0x0C` `23 01 01` / `23 01 00` | Sleep/wake gimbal motors.               |
+| `recenter` / `selfie`| `0x0E/0x0E` `FE 01` / `FE 02`      | Recenter once / selfie pose.            |
+| `calibrate`          | `0x0E/0x0F` `00 01 01`             | AutoTune gimbal motors for the payload. |
+| `motor-calib`        | `0x0E/0x12` `02 00 01`             | Focus-motor endpoint calibration; clears the zoom ramp state, then re-queries position. |
+| `activetrack`        | `0x0E/0x11` `03`                   | Toggle ActiveTrack (no status feedback).|
+| `rec-start` / `rec-stop` | `0x0D/0x00` `03 00` / `04 00`  | Camera record (needs DJI camera-control cable). |
+| `focus-center-start` / `focus-center-stop` | `0x0D/0x00` `05 00` / `0B 00` | Camera center-focus. |
+| `push-on` / `push-off` | `0x0E/0x07` `01` / `00`          | Enable/disable gimbal parameter push.   |
+| `cam-cmd`            | `0x0D/0x01` `01`                   | Camera query; reply logged on serial.   |
+| `limit`              | `0x0E/0x04` `01`                   | Query limit angles; reply parsed into state. |
+| `version`            | `0x0E/0x09`                        | Query module version; parsed into state. |
+| `zoom_get`           | `0x0E/0x12` `15 00`                | Query focus-motor position.             |
+| `stop`               | —                                  | Release held speed and send one zero-speed packet. |
 
-- `GET  /api/status` → `{wifi_rssi, ip, ws_clients}`
-- `POST /api/recenter`, `/api/selfie`, `/api/activetrack`
-- `POST /api/focus?position=2048`
-- `POST /api/push?enable=1`
-- `POST /api/speed?yaw=0&roll=0&pitch=0` (one-shot; for continuous control use the WebSocket)
+Device → browser: the state snapshot every 50 ms (20 Hz):
+
+```json
+{
+  "connected": true, "adapter": "mcp2515", "interface": "can",
+  "yaw": 12.3, "roll": -0.4, "pitch": -89.9,
+  "zoom": 2048, "zoom_target": 3000, "zoom_vmax": 900, "zoom_accel": 1800,
+  "last_rx_age_s": 0.02, "last_error": null, "tx_ok": 1234, "rx_ok": 980,
+  "rssi": -58, "can_state": "running", "version": "1.2.3.4"
+}
+```
+
+(`version` appears after a `version` command reply; `limits` likewise after `limit`.)
+
+### REST (`/api/*`) — JSON bodies, one-shot commands
+
+- `GET  /api/state` → the snapshot above (same keys as the WS stream)
+- `POST /api/speed` `{"yaw":0,"roll":0,"pitch":0,"hold":true}`
+- `POST /api/position` `{"yaw":0,"roll":0,"pitch":0,"time_s":0.8}`
+- `POST /api/zoom` `{"position":2048}`
+- `POST /api/zoom/profile` `{"vmax":900,"accel":1800}`
+- `POST /api/command/<name>` — any named command from the table above
+- `GET  /api/status` → `{wifi_rssi, ip, ws_clients, can:{...}}` (ESP32 CAN diagnostics)
+- `POST /api/can/probe` → TX a lone `0x100` frame to check for a bus peer
+
+### Zoom ramp
+
+`zoom` sets a *target*; firmware advances the commanded position toward it at 20 Hz with a
+trapezoidal profile (`vmax`, `accel`), sending `focus-set` only when the integer position
+changes. The first focus-motor reply after boot (or after `motor-calib`) seeds the ramp so
+the motor never jumps on the first command. This is a direct port of `zoom_ramp_step()` in
+`dji_can_session.py`.
 
 ## Safety: the speed watchdog
 
 Because control now travels over WiFi instead of a wired connection, a dropped connection
 must not leave the gimbal spinning at whatever speed it last received. `main.cpp` tracks the
 time of the last `speed` command and **zeroes the gimbal's speed if none arrives within
-250 ms** while a non-zero speed is active (see `sendSpeedIfDue()`), and also zeroes speed
-immediately when the last WebSocket client disconnects. If you build a different client than
-the bundled web UI, make sure it either sends `speed` updates continuously while deflected or
-explicitly sends a zero `speed` command on release — don't rely on a single "fire and forget"
-command for anything continuous.
+250 ms** while a non-zero speed is active (the same `DEADMAN_S = 0.25` as the Python
+session), and also zeroes speed when the last WebSocket client disconnects. If you build a
+different client than the bundled web UI, make sure it either sends `speed` updates
+continuously while deflected or explicitly sends `stop`/a zero `speed` on release — don't
+rely on a single "fire and forget" command for anything continuous.
 
 ## Known gaps / left to reverse-engineer
 
 Everything about the packet framing and the commands used here (`0x00`, `0x01`, `0x02`,
-`0x07`, `0x08`, `0x0E`, `0x11`, `0x12`) is carried over as-is from the validated Python CLI.
-Not yet ported/decoded (see `docs/DJI_R_SDK_Protocol.md` §Status for the full list):
+`0x04`, `0x07`, `0x08`, `0x09`, `0x0B`, `0x0C`, `0x0E`, `0x0F`, `0x11`, `0x12`, plus camera
+`0x0D/0x00` and `0x0D/0x01`) is carried over as-is from the validated Python CLI. Remaining
+gaps (see `docs/DJI_R_SDK_Protocol.md` §Status for the full list):
 
-- `0x04` (limit angles), `0x06` (stiffness), `0x0B` (user params) — `dji_can_protocol.h`
-  intentionally doesn't include builders for these yet; add them the same way as the CLI's
-  versions if you need them from the web UI.
+- `0x06` (stiffness) and `0x0B` (user params) have builders (`buildObtainMotorStiffness`,
+  `buildObtainGimbalUserParams[Poll]`) but no REST/WS command or parser wired up — same as
+  the Python web server, which doesn't expose them either.
 - `0x10` (auto-calibration status push) is received but not parsed/surfaced.
-- Only one `data_type` value (`0x00`, attitude) has ever been observed on the `0x08` push;
-  other values are unhandled.
 
 ## Repo layout
 
