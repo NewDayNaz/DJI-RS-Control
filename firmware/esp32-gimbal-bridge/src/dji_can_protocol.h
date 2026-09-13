@@ -86,7 +86,7 @@ std::vector<uint8_t> buildFocusCenterStart();  // 0x0D/0x00 05 00
 std::vector<uint8_t> buildFocusCenterStop();   // 0x0D/0x00 0B 00
 std::vector<uint8_t> buildCameraCmd();         // 0x0D/0x01 01
 std::vector<uint8_t> buildFocusSet(uint16_t position, uint8_t cmdSubId = 0x01,
-                                    uint8_t ctlType = 0x00, uint8_t dataLength = 0x02); // 0-4096
+                                    uint8_t ctlType = 0x00, uint8_t dataLength = 0x02); // 1-4095 (0→1, 4096→4095)
 std::vector<uint8_t> buildFocusGet();
 
 // ---- Reply / push parsing ----

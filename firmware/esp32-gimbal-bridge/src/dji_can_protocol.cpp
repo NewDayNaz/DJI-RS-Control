@@ -287,6 +287,12 @@ std::vector<uint8_t> buildCameraCmd() {
 
 std::vector<uint8_t> buildFocusSet(uint16_t position, uint8_t cmdSubId,
                                     uint8_t ctlType, uint8_t dataLength) {
+    // The motor-calib span is documented as 0–4096, but the gimbal ignores the
+    // exact endpoints: 0 is treated as empty, and 4096 does not fit in 12 bits
+    // (max 4095). Command 1 and 4095 instead; that still reaches the buffered
+    // digital-tele / past-wide stops.
+    if (position < 1) position = 1;
+    if (position > 4095) position = 4095;
     uint8_t d[5];
     d[0] = cmdSubId;
     d[1] = ctlType;
