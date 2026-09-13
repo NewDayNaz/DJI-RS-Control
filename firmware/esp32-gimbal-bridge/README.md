@@ -117,6 +117,27 @@ pio device monitor           # serial log at 115200 baud
 These commands target the default env (`seeed_xiao_esp32c3`). Flash from PowerShell or cmd,
 not Git Bash — see `.cursor/rules/platformio-windows-flash.mdc`.
 
+## Tests
+
+Host tests do not need the board. From this directory:
+
+```bash
+pytest -q                          # ramp + CAN packet checks (no motor)
+pio test -e native                 # same ramp, compiled against src/zoom_ramp.h
+```
+
+Physical checks talk to a live bridge over HTTP and **move the zoom motor** at a
+modest vmax. They skip unless you opt in:
+
+```bash
+GIMBAL_HW=1 pytest -q -m hardware
+# optional: GIMBAL_URL=https://djicontrol.lan.mgraham.me
+```
+
+That suite probes CAN ACK, attitude push, `zoom_get`, a mid-range move, an
+interrupt/reverse, and a low→high jump. It does not send sleep, autotune,
+motor-calib, or gimbal body speed.
+
 Note: XIAO ESP32C3 boards ship with `BOOT` (D9) held for manual bootloader entry on some
 USB-driver setups. D9 is also MCP2515 MISO once the hat is on, which does not matter in
 the bootloader. If `pio run -t upload` can't find/flash the board, hold `BOOT`, tap
@@ -135,8 +156,10 @@ Browser → device, JSON text frames:
 |----------------|--------------------------------------|---------------------------------------------------------------|
 | `speed`        | `yaw`, `roll`, `pitch` (°/s), `hold` | `hold:true` re-sends at 20 Hz until released; send at ~20 Hz while deflected (the UI does). `hold:false` fires once. |
 | `position`     | `yaw`, `roll`, `pitch` (°), `time_s` | Absolute go-to (CmdSet `0x0E` CmdID `0x00`).                   |
-| `zoom`         | `position` (0–4096)                  | Focus-motor target; the device ramps to it (see below).        |
+| `zoom`         | `position` (0–4096) **or** `mm`     | Focus-motor target, or millimetres if a lens table is enabled. |
 | `zoom_profile` | `vmax` (50–8000 /s), `accel` (50–40000 /s²) | Ramp tuning for `zoom`.                               |
+| `lens_sample`  | `mm`, optional `pos`, `dir`         | Record camera focal length at the current (or given) motor pos. |
+| `lens_clear`   | —                                    | Wipe the stored millimetre table.                              |
 | `<name>`       | —                                    | Any named command below.                                       |
 
 Named commands (same strings over WS `{"cmd": name}` and REST `POST /api/command/<name>`):
@@ -164,6 +187,7 @@ Device → browser: the state snapshot every 50 ms (20 Hz):
   "connected": true, "adapter": "mcp2515", "interface": "can",
   "yaw": 12.3, "roll": -0.4, "pitch": -89.9,
   "zoom": 2048, "zoom_target": 3000, "zoom_vmax": 900, "zoom_accel": 1800,
+  "zoom_moving": false, "zoom_mm": 35.0, "lens_enabled": true, "lens_points": 12,
   "last_rx_age_s": 0.02, "last_error": null, "tx_ok": 1234, "rx_ok": 980,
   "rssi": -58, "can_state": "running", "version": "1.2.3.4"
 }
@@ -176,11 +200,15 @@ Device → browser: the state snapshot every 50 ms (20 Hz):
 - `GET  /api/state` → the snapshot above (same keys as the WS stream)
 - `POST /api/speed` `{"yaw":0,"roll":0,"pitch":0,"hold":true}`
 - `POST /api/position` `{"yaw":0,"roll":0,"pitch":0,"time_s":0.8}`
-- `POST /api/zoom` `{"position":2048}`
+- `POST /api/zoom` `{"position":2048}` or `{"mm":50}`
 - `POST /api/zoom/profile` `{"vmax":900,"accel":1800}`
+- `GET  /api/zoom/lens` / `POST /api/zoom/lens` — per-lens millimetre table (NVS)
+- `POST /api/zoom/lens/sample` `{"mm":35,"pos":1024,"dir":1}`
+- `POST /api/zoom/lens/enable` `{"enabled":true}`
+- `POST /api/zoom/lens/clear`
 - `POST /api/command/<name>` — any named command from the table above
 - `GET  /api/status` → `{wifi_rssi, ip, ws_clients, can:{...}, ptz:{...}}` (ESP32 CAN + PTZ diagnostics)
-- `POST /api/ptz/profile` `{"max_rate":30,"invert_pan":false,"invert_tilt":false}`
+- `POST /api/ptz/profile` `{"max_rate":30,"invert_pan":false,"invert_tilt":false,"invert_zoom":true}`
 - `POST /api/can/probe` → TX a lone `0x100` frame to check for a bus peer
 
 ## Hardware PTZ controllers
@@ -205,9 +233,11 @@ Point the controller at the bridge's IP, camera address **1**. Pick the matching
 | Panasonic AW HTTP | HTTP GET | 80 | `/cgi-bin/aw_ptz?cmd=#PTS5050&res=1` |
 
 Speed 1–24 (VISCA) / 1–63 (Pelco) / 01–99 (Panasonic, 50 = stop) scales into the **PTZ max
-rate** shown in the web UI (default 30°/s). Invert pan or tilt there if the stick feels
-backwards. Sixteen RAM presets (`CAM_Memory` / Pelco preset / `#M` `#R`) store the current
-attitude until reboot.
+rate** shown in the web UI (default 30°/s). Invert pan, tilt, or zoom there if an axis feels
+backwards (zoom defaults inverted: motor 0 is tele including 2× digital, 4096 is wide with
+overtravel past the optical stop). Sixteen RAM presets (`CAM_Memory` / Pelco preset / `#M` `#R`) store the current
+attitude and focus-motor zoom until reboot. Recall goes to the saved pose and ramps zoom
+to the stored count; an empty slot still just recenters.
 
 ONVIF is not implemented: SOAP + WS-Discovery does not fit the C3, and dedicated PTZ
 hardware almost never speaks it.
@@ -216,9 +246,21 @@ hardware almost never speaks it.
 
 `zoom` sets a *target*; firmware advances the commanded position toward it at 20 Hz with a
 trapezoidal profile (`vmax`, `accel`), sending `focus-set` only when the integer position
-changes. The first focus-motor reply after boot (or after `motor-calib`) seeds the ramp so
-the motor never jumps on the first command. This is a direct port of `zoom_ramp_step()` in
-`dji_can_session.py`.
+changes. PTZ zoom/focus rockers use that same profile at 2× accel: hold eases up to a speed
+scaled by the protocol, release coasts to a stop in about half the slider/preset ramp time.
+The first focus-motor reply after boot (or after `motor-calib`) seeds the ramp so the motor
+never jumps on the first command. The step function lives in `src/zoom_ramp.h` so host
+tests run the same code (extended from `zoom_ramp_step()` in `dji_can_session.py` with
+independent decel, T_running/vcut, and reverse-on-retarget).
+
+Power-zoom lenses lag or overshoot the ring when you move it quickly, so motor counts are
+not a stable focal length. Motor 0 is fully in (optical tele plus 2× digital); 4096 is fully
+out, a little past optical wide. **Calibrate lens** in the web UI starts wide and creeps in;
+after each stop you type the millimetre value the camera shows (including digital). That
+builds a direction-aware table stored in NVS (it survives a LittleFS/`uploadfs` flash).
+A final jump at your working speed checks whether the lens still matches; if it misses, max
+speed is halved. With the table enabled, go-to-mm, VISCA/Pelco absolute zoom, and the
+estimated mm readout all use it. Rockers still drive rate, but through the capped ramp.
 
 ## Safety: the speed watchdog
 
@@ -252,9 +294,12 @@ firmware/esp32-gimbal-bridge/
   platformio.ini           PlatformIO env (XIAO C3 + MCP2515 hat)
   src/
     main.cpp                WiFi/WebSocket/REST glue, safety watchdog, PTZ sink
+    zoom_ramp.h             Trapezoidal zoom ramp (firmware + host tests)
     can_hw.h/.cpp           MCP2515 CAN backend for the Seeed hat
     dji_can_protocol.h/.cpp  Packet framing ported from dji_gimbal_cli.py
     ptz_bridge.h/.cpp        VISCA / Pelco / Panasonic AW / HTTP CGI camera-side
+  test/test_zoom_ramp/     Native Unity tests for the ramp
+  tests/                   pytest: packets, ramp model, opt-in hardware
   data/
     index.html               Joystick + telemetry web UI (served via LittleFS)
 ```
