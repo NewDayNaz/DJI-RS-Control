@@ -24,7 +24,7 @@ struct PtzSink {
     void (*speed)(float yawDps, float rollDps, float pitchDps);
     void (*stop)();
     void (*position)(float yawDeg, float rollDeg, float pitchDeg, float timeS);
-    void (*zoomAbs)(int position);       // 0-4096 focus-motor counts
+    void (*zoomAbs)(int position);       // 1-4095 focus-motor counts (0→1, 4096→4095)
     void (*zoomRate)(float signedRate);  // -1 wide .. +1 tele, 0 = freeze
     void (*home)();
     void (*sleep)();
@@ -33,6 +33,10 @@ struct PtzSink {
     void (*recStop)();
     bool (*getAttitude)(float *yawDeg, float *rollDeg, float *pitchDeg);
     bool (*getZoom)(int *position);
+    // Optional lens map. t=0 optical wide, t=1 tele. When set, VISCA direct
+    // zoom uses millimetres instead of raw motor counts.
+    bool (*zoomFromOptical)(float t, int *position);
+    bool (*zoomToOptical)(int position, float *t);
 };
 
 void ptzBridgeBegin(const PtzSink &sink);
@@ -40,4 +44,4 @@ void ptzBridgeRegisterHttp(AsyncWebServer &server);
 void ptzBridgeFillStatus(JsonObject obj);
 void ptzBridgeSetMaxRate(float dps);
 float ptzBridgeMaxRate();
-void ptzBridgeSetInvert(bool pan, bool tilt);
+void ptzBridgeSetInvert(bool pan, bool tilt, bool zoom);

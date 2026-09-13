@@ -28,10 +28,16 @@ static PtzSink g_sink = {};
 static float g_maxRate = kMaxRateDefault;
 static bool g_invertPan = false;
 static bool g_invertTilt = false;
+// Focus-motor 0 is tele (optical plus 2× digital); 4096 is wide with a little
+// overtravel past the optical stop. Those endpoints are sent as 1 / 4095.
+// PTZ "zoom in" therefore decreases counts.
+static bool g_invertZoom = true;
 
 struct Preset {
     bool set = false;
+    bool haveZoom = false;
     float yaw = 0, roll = 0, pitch = 0;
+    int zoom = 0; // focus-motor counts, 0-4096
 };
 static Preset g_presets[kPresetCount];
 
@@ -88,6 +94,11 @@ static void noteCmdHost(const char *cmd, const char *from) {
 static float applyPan(float yawDps) { return g_invertPan ? -yawDps : yawDps; }
 static float applyTilt(float pitchDps) { return g_invertTilt ? -pitchDps : pitchDps; }
 
+static void ptzZoomRate(float rate) {
+    if (!g_sink.zoomRate) return;
+    g_sink.zoomRate(g_invertZoom ? -rate : rate);
+}
+
 static float viscaPanDps(uint8_t vv) {
     if (vv == 0) return 0.0f;
     float n = (float) vv / 24.0f;
@@ -129,10 +140,28 @@ static void putNibbles4(uint8_t *p, uint16_t v) {
 
 static int viscaToZoom(uint16_t v) {
     if (v > 0x4000) v = 0x4000;
-    return (int) ((uint32_t) v * kZoomMax / 0x4000);
+    float t = (float) v / (float) 0x4000;
+    int z;
+    if (g_sink.zoomFromOptical && g_sink.zoomFromOptical(t, &z)) {
+        if (z < 1) z = 1;
+        if (z > 4095) z = 4095;
+        return z;
+    }
+    z = (int) ((uint32_t) v * kZoomMax / 0x4000);
+    z = g_invertZoom ? (kZoomMax - z) : z;
+    if (z < 1) z = 1;
+    if (z > 4095) z = 4095;
+    return z;
 }
 
 static uint16_t zoomToVisca(int z) {
+    float t;
+    if (g_sink.zoomToOptical && g_sink.zoomToOptical(z, &t)) {
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+        return (uint16_t) lroundf(t * (float) 0x4000);
+    }
+    if (g_invertZoom) z = kZoomMax - z;
     if (z < 0) z = 0;
     if (z > kZoomMax) z = kZoomMax;
     return (uint16_t) ((uint32_t) z * 0x4000 / kZoomMax);
@@ -176,6 +205,7 @@ static void recallPreset(int idx) {
     if (g_presets[idx].set && g_sink.position) {
         const Preset &p = g_presets[idx];
         g_sink.position(p.yaw, p.roll, p.pitch, moveTimeS(p.yaw, p.pitch));
+        if (p.haveZoom && g_sink.zoomAbs) g_sink.zoomAbs(p.zoom);
     } else if (g_sink.home) {
         g_sink.home();
     }
@@ -189,6 +219,9 @@ static void savePreset(int idx) {
         g_presets[idx].yaw = y;
         g_presets[idx].roll = r;
         g_presets[idx].pitch = p;
+        int z = 0;
+        g_presets[idx].haveZoom = g_sink.getZoom && g_sink.getZoom(&z);
+        g_presets[idx].zoom = z;
     }
 }
 
@@ -258,19 +291,19 @@ static void handleVisca(const uint8_t *m, size_t n, ViscaOut &out) {
         if (n >= 6 && m[2] == 0x04 && m[3] == 0x07) {
             uint8_t p = m[4];
             if (p == 0x00) {
-                if (g_sink.zoomRate) g_sink.zoomRate(0);
+                ptzZoomRate(0);
                 noteCmd("visca zoom-stop");
             } else if (p == 0x02) {
-                if (g_sink.zoomRate) g_sink.zoomRate(0.5f);
+                ptzZoomRate(0.5f);
                 noteCmd("visca zoom-tele");
             } else if (p == 0x03) {
-                if (g_sink.zoomRate) g_sink.zoomRate(-0.5f);
+                ptzZoomRate(-0.5f);
                 noteCmd("visca zoom-wide");
             } else if ((p & 0xF0) == 0x20) {
-                if (g_sink.zoomRate) g_sink.zoomRate(viscaZoomRate(p & 0x0F, +1));
+                ptzZoomRate(viscaZoomRate(p & 0x0F, +1));
                 noteCmd("visca zoom-tele");
             } else if ((p & 0xF0) == 0x30) {
-                if (g_sink.zoomRate) g_sink.zoomRate(viscaZoomRate(p & 0x0F, -1));
+                ptzZoomRate(viscaZoomRate(p & 0x0F, -1));
                 noteCmd("visca zoom-wide");
             }
             return;
@@ -279,13 +312,13 @@ static void handleVisca(const uint8_t *m, size_t n, ViscaOut &out) {
             // Focus rocker → same motor as zoom (the gimbal has one lens axis).
             uint8_t p = m[4];
             if (p == 0x00) {
-                if (g_sink.zoomRate) g_sink.zoomRate(0);
+                ptzZoomRate(0);
                 noteCmd("visca focus-stop");
             } else if (p == 0x02 || (p & 0xF0) == 0x20) {
-                if (g_sink.zoomRate) g_sink.zoomRate(viscaZoomRate(p & 0x0F, +1));
+                ptzZoomRate(viscaZoomRate(p & 0x0F, +1));
                 noteCmd("visca focus-far");
             } else if (p == 0x03 || (p & 0xF0) == 0x30) {
-                if (g_sink.zoomRate) g_sink.zoomRate(viscaZoomRate(p & 0x0F, -1));
+                ptzZoomRate(viscaZoomRate(p & 0x0F, -1));
                 noteCmd("visca focus-near");
             }
             return;
@@ -601,11 +634,11 @@ static void handlePelcoBits(uint8_t cmd1, uint8_t cmd2, uint8_t d1, uint8_t d2) 
 
     // Each Pelco frame is a full bitfield snapshot, including the lens rocker.
     if (tele || focusFar) {
-        if (g_sink.zoomRate) g_sink.zoomRate(0.6f);
+        ptzZoomRate(0.6f);
     } else if (wide || focusNear) {
-        if (g_sink.zoomRate) g_sink.zoomRate(-0.6f);
-    } else if (g_sink.zoomRate) {
-        g_sink.zoomRate(0);
+        ptzZoomRate(-0.6f);
+    } else {
+        ptzZoomRate(0);
     }
 
     noteCmd((left || right || up || down || tele || wide || focusFar || focusNear)
@@ -684,18 +717,18 @@ static const char *handleAw(char *cmd) {
     }
     if (n >= 3 && cmd[0] == 'Z') {
         int z = awDigits(cmd + 1, 2);
-        if (z >= 0 && g_sink.zoomRate) {
+        if (z >= 0) {
             float r = awNorm(z);
-            g_sink.zoomRate(fabsf(r) < 0.02f ? 0.0f : r);
+            ptzZoomRate(fabsf(r) < 0.02f ? 0.0f : r);
             noteCmd("aw zoom");
         }
         return "sST";
     }
     if (n >= 3 && cmd[0] == 'F') {
         int z = awDigits(cmd + 1, 2);
-        if (z >= 0 && g_sink.zoomRate) {
+        if (z >= 0) {
             float r = awNorm(z);
-            g_sink.zoomRate(fabsf(r) < 0.02f ? 0.0f : r);
+            ptzZoomRate(fabsf(r) < 0.02f ? 0.0f : r);
             noteCmd("aw focus");
         }
         return "sST";
@@ -913,15 +946,15 @@ static void handlePtzOpticsCgi(AsyncWebServerRequest *req) {
     else if (act == "rightdown" || act == "downright") driveSpeed(pan, -tilt);
     else if (act == "ptzstop" || act == "stop") {
         if (g_sink.stop) g_sink.stop();
-        if (g_sink.zoomRate) g_sink.zoomRate(0);
+        ptzZoomRate(0);
     } else if (act == "home") {
         if (g_sink.home) g_sink.home();
     } else if (act == "zoomin") {
-        if (g_sink.zoomRate) g_sink.zoomRate(cgiSpeed(spd, 8.0f) / g_maxRate);
+        ptzZoomRate(cgiSpeed(spd, 8.0f) / g_maxRate);
     } else if (act == "zoomout") {
-        if (g_sink.zoomRate) g_sink.zoomRate(-cgiSpeed(spd, 8.0f) / g_maxRate);
+        ptzZoomRate(-cgiSpeed(spd, 8.0f) / g_maxRate);
     } else if (act == "zoomstop") {
-        if (g_sink.zoomRate) g_sink.zoomRate(0);
+        ptzZoomRate(0);
     }
     cgiOk(req);
 }
@@ -990,14 +1023,17 @@ void ptzBridgeRegisterHttp(AsyncWebServer &server) {
             if (!body["max_rate"].isNull()) ptzBridgeSetMaxRate(body["max_rate"] | kMaxRateDefault);
             bool pan = g_invertPan;
             bool tilt = g_invertTilt;
+            bool zoom = g_invertZoom;
             if (!body["invert_pan"].isNull()) pan = body["invert_pan"].as<bool>();
             if (!body["invert_tilt"].isNull()) tilt = body["invert_tilt"].as<bool>();
-            ptzBridgeSetInvert(pan, tilt);
+            if (!body["invert_zoom"].isNull()) zoom = body["invert_zoom"].as<bool>();
+            ptzBridgeSetInvert(pan, tilt, zoom);
             JsonDocument doc;
             doc["ok"] = "ptz-profile";
             doc["max_rate"] = g_maxRate;
             doc["invert_pan"] = g_invertPan;
             doc["invert_tilt"] = g_invertTilt;
+            doc["invert_zoom"] = g_invertZoom;
             String out;
             serializeJson(doc, out);
             req->send(200, "application/json", out);
@@ -1009,6 +1045,7 @@ void ptzBridgeFillStatus(JsonObject obj) {
     obj["max_rate"] = g_maxRate;
     obj["invert_pan"] = g_invertPan;
     obj["invert_tilt"] = g_invertTilt;
+    obj["invert_zoom"] = g_invertZoom;
     obj["visca_udp"] = g_nViscaUdp;
     obj["visca_tcp"] = g_nViscaTcp;
     obj["pelco"] = g_nPelco;
@@ -1031,9 +1068,10 @@ void ptzBridgeSetMaxRate(float dps) {
 
 float ptzBridgeMaxRate() { return g_maxRate; }
 
-void ptzBridgeSetInvert(bool pan, bool tilt) {
+void ptzBridgeSetInvert(bool pan, bool tilt, bool zoom) {
     g_invertPan = pan;
     g_invertTilt = tilt;
+    g_invertZoom = zoom;
 }
 
 void ptzBridgeBegin(const PtzSink &sink) {
