@@ -44,7 +44,7 @@
     margin: 0 0 12px; font-size: 11px; font-weight: 600;
     letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
   }
-  select, input[type="number"], button {
+  select, input[type="number"], input[type="text"], button {
     background: var(--panel-2); color: var(--text);
     border: 1px solid var(--line); border-radius: 6px;
     padding: 6px 10px; font: inherit;
@@ -103,6 +103,38 @@
   .can-diag .hint { color: var(--text); margin-top: 6px; line-height: 1.35; white-space: pre-wrap; }
   .can-diag button { padding: 8px 10px; font-size: 12px; margin-top: 8px; }
 
+  .lens-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+  .lens-row input[type="number"] { width: 88px; }
+  .lens-row button { flex: 0 0 auto; }
+  .lens-meta { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .lens-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  .lens-table th, .lens-table td {
+    text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line);
+    font-variant-numeric: tabular-nums;
+  }
+  .modal {
+    display: none; position: fixed; inset: 0; z-index: 20;
+    background: rgba(0,0,0,.55); align-items: center; justify-content: center;
+    padding: 16px;
+  }
+  .modal.open { display: flex; }
+  .modal .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px 18px; width: min(560px, 100%); max-height: 90vh; overflow: auto;
+  }
+  .modal .card h3 { margin: 0 0 8px; font-size: 15px; }
+  .table-wrap { max-height: 180px; overflow: auto; margin-top: 8px; }
+  .modal .setup { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0; }
+  .modal .setup label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .modal .setup input { width: 100%; }
+  .modal .actions { display: flex; gap: 8px; margin-top: 14px; }
+  .modal .actions button { flex: 1; }
+  .mm-entry { display: flex; gap: 8px; margin-top: 12px; }
+  .mm-entry input { flex: 1; font-size: 20px; padding: 10px; }
+  .choice { display: none; flex-direction: column; gap: 8px; margin-top: 12px; }
+  .choice button { padding: 12px 10px; }
+  .choice button.big { padding: 18px 12px; font-size: 16px; }
+
   @media (max-width: 980px) {
     main { grid-template-columns: 1fr; }
     .angle b { font-size: 22px; }
@@ -125,7 +157,7 @@
         <div class="angle"><label>Yaw</label><b id="yaw">—</b></div>
         <div class="angle"><label>Roll</label><b id="roll">—</b></div>
         <div class="angle"><label>Pitch</label><b id="pitch">—</b></div>
-        <div class="angle"><label>Zoom</label><b id="zoomNow">—</b></div>
+        <div class="angle"><label id="zoomNowLbl">Zoom</label><b id="zoomNow">—</b></div>
       </div>
       <div class="pad-wrap">
         <div class="stick" id="stick">
@@ -175,15 +207,42 @@
       <button class="primary" id="btnGoto" style="width:100%">Go</button>
       <h2 style="margin-top:18px">Zoom</h2>
       <div class="zoom">
-        <label class="row"><span>Target</span><span class="zoom-val" id="zoomVal">0</span></label>
+        <label class="row"><span>Target · 0 in / 4096 out</span><span class="zoom-val" id="zoomVal">0</span></label>
         <input id="zoom" type="range" min="0" max="4096" value="0" />
+        <label class="row" style="font-size:11px; margin-top:2px">
+          <span>In · tele · 2× digital</span><span>Out · wide</span>
+        </label>
         <label class="row" style="margin-top:10px"><span>Max speed</span><span id="zoomVLabel">900 /s</span></label>
         <input id="zoomVmax" type="range" min="150" max="4000" value="900" />
-        <label class="row"><span>Ease</span><span id="zoomALabel">1800 /s²</span></label>
-        <input id="zoomAccel" type="range" min="200" max="12000" value="1800" />
+        <label class="row"><span>Accel</span><span id="zoomALabel">4500 /s²</span></label>
+        <input id="zoomAccel" type="range" min="200" max="16000" value="4500" />
+        <label class="row"><span>Min run</span><span id="zoomCLabel">120 /s</span></label>
+        <input id="zoomVcut" type="range" min="0" max="600" value="120" title="T_running: ease down to this, then stop. Not max speed." />
+        <div class="lens-row">
+          <label class="row" style="flex:1"><span>Go to mm</span></label>
+          <input id="zoomMm" type="number" min="1" max="2000" step="0.1" placeholder="50" inputmode="decimal" />
+          <button id="btnZoomMm">Go</button>
+        </div>
+        <div class="lens-row">
+          <label class="row" style="flex:1"><span>Camera shows</span></label>
+          <input id="recordMm" type="number" min="1" max="2000" step="0.1" placeholder="mm" inputmode="decimal" />
+          <span style="color:var(--muted);font-size:12px">×</span>
+          <input id="digitalMul" type="number" min="1" max="2" step="0.1" value="2" title="Digital zoom multiplier (1 = optical, 2 = 2× digital)" style="width:64px" />
+          <button id="btnRecordMm">Record</button>
+        </div>
+        <p class="lens-meta" id="lensMeta">No lens profile yet.</p>
+        <div class="table-wrap" id="lensTable"></div>
+        <label class="row" style="margin-top:8px; font-size:12px; color:var(--muted)">
+          <span><input type="checkbox" id="lensEnabled" /> Use lens table for zoom</span>
+        </label>
+        <div class="grid-btns" style="margin-top:8px">
+          <button id="btnLensCalib">Calibrate lens</button>
+          <button id="btnLensClear">Clear table</button>
+        </div>
       </div>
-      <p class="hint">The device ramps toward the target at 20 Hz so the motor eases in and
-        out. Run motor calib first, F mode. Rec and center-focus need the DJI camera-control cable.</p>
+      <p class="hint">Characterize speeds first (Yes/No + typed LCD), then map millimetres with
+        that motion profile. Go-to millimetres lands on the table position — it does not pad
+        short moves. 0→1 in, 4096→4095 out. Motor calib, F mode.</p>
     </section>
 
     <section>
@@ -212,12 +271,48 @@
         <label class="row" style="margin-top:8px; font-size:12px; color:var(--muted)">
           <span><input type="checkbox" id="ptzInvPan" /> Invert pan</span>
           <span><input type="checkbox" id="ptzInvTilt" /> Invert tilt</span>
+          <span><input type="checkbox" id="ptzInvZoom" checked /> Invert zoom (0 = tele)</span>
         </label>
         <p class="hint">Point a VISCA / Pelco / Panasonic joystick at this IP.
           Camera address 1. Zoom and focus both drive the gimbal focus motor.</p>
       </div>
     </section>
   </main>
+
+  <div id="lensModal" class="modal">
+    <div class="card">
+      <h3 id="lensTitle">Lens calibration</h3>
+      <p class="hint" id="lensBlurb">Two steps. First characterize the motion profile: the motor
+        jogs, you say whether the LCD millimetres changed (or type them). That picks min-run,
+        cruise, and accel. Then map millimetres with that same profile.
+        Overlay gone: rocker a hair on the camera to refresh it, then type. Motor stop wrong:
+        power-zoom the rocker, leave the gimbal ring, type.</p>
+      <div id="lensSetup" class="setup">
+        <div><label>Name</label><input id="lensName" type="text" value="lens" maxlength="23" /></div>
+        <div><label>Map points</label><input id="lensSteps" type="number" min="4" max="12" value="7" /></div>
+        <div><label>Wide mm</label><input id="lensWide" type="number" min="1" max="2000" step="0.1" value="18" /></div>
+        <div><label>Tele mm</label><input id="lensTele" type="number" min="1" max="2000" step="0.1" value="105" /></div>
+        <div><label>Settle seconds</label><input id="lensSettle" type="number" min="0.4" max="6" step="0.1" value="2" /></div>
+        <div><label>Digital × at tele</label><input id="lensDigi" type="number" min="1" max="2" step="0.1" value="2" /></div>
+        <div><label>Repeatability mm</label><input id="lensTol" type="number" min="0.1" max="5" step="0.1" value="0.5" title="Max spread of repeated landings when picking cruise speed." /></div>
+        <div><label>Repeats</label><input id="lensRepeats" type="number" min="2" max="4" value="2" /></div>
+      </div>
+      <p class="lens-meta" id="lensProgress"></p>
+      <div id="lensMmWrap" class="mm-entry" style="display:none">
+        <input id="lensMm" type="number" min="1" max="2000" step="0.1" placeholder="LCD mm" inputmode="decimal" />
+        <span style="color:var(--muted);align-self:center">×</span>
+        <input id="lensDigitalMul" type="number" min="1" max="2" step="0.1" value="1" title="Digital × from the LCD, or 1" style="width:64px" />
+        <button class="primary" id="lensMmGo">Record</button>
+      </div>
+      <div id="lensChoices" class="choice"></div>
+      <div class="table-wrap" id="lensTableModal"></div>
+      <div class="actions">
+        <button id="lensCancel">Cancel</button>
+        <button id="lensStart">Map millimetres</button>
+        <button class="primary" id="lensChar">Characterize speeds</button>
+      </div>
+    </div>
+  </div>
 
 <script>
 (() => {
@@ -235,6 +330,14 @@
   let zoomProfileTimer = null;
   let zoomTouched = false;
   let keys = new Set();
+  let zoomMoving = false;
+  let zoomPosNow = 0;
+  let lens = {
+    enabled: false, points: 0, in: [], out: [], name: "", wide: 0, tele: 0,
+    coupling: false, engageIn: 0, engageOut: 0, settle: 1.5, curves: [],
+    vmax: 900, accel: 4500, decel: 4500, vcut: 0, vstatic: 0, repeatMm: 0,
+  };
+  let calib = { running: false, moving: false, settleMs: 1500, lastReading: null };
 
   function fmt(v) {
     return (typeof v !== "number" || Number.isNaN(v)) ? "—" : v.toFixed(1) + "°";
@@ -251,11 +354,35 @@
     $("yaw").textContent = fmt(s.yaw);
     $("roll").textContent = fmt(s.roll);
     $("pitch").textContent = fmt(s.pitch);
-    $("zoomNow").textContent = (typeof s.zoom === "number") ? String(s.zoom) : "—";
+    zoomMoving = !!s.zoom_moving;
+    calib.moving = zoomMoving;
+    if (typeof s.zoom === "number") zoomPosNow = s.zoom;
+    if (typeof s.zoom_mm === "number") {
+      $("zoomNow").textContent = s.zoom_mm.toFixed(1);
+      $("zoomNowLbl").textContent = "Zoom mm";
+    } else {
+      $("zoomNow").textContent = (typeof s.zoom === "number") ? String(s.zoom) : "—";
+      $("zoomNowLbl").textContent = "Zoom";
+    }
     if (typeof s.zoom_target === "number" && document.activeElement !== $("zoom") && !zoomTouched) {
       $("zoom").value = String(s.zoom_target);
       $("zoomVal").textContent = String(s.zoom_target);
     }
+    if (typeof s.zoom_vmax === "number" && document.activeElement !== $("zoomVmax")) {
+      $("zoomVmax").value = String(Math.round(s.zoom_vmax));
+      $("zoomVLabel").textContent = Math.round(s.zoom_vmax) + " /s";
+    }
+    if (typeof s.zoom_accel === "number" && document.activeElement !== $("zoomAccel")) {
+      $("zoomAccel").value = String(Math.round(s.zoom_accel));
+      $("zoomALabel").textContent = Math.round(s.zoom_accel) + " /s²";
+    }
+    if (typeof s.zoom_vcut === "number" && document.activeElement !== $("zoomVcut")) {
+      $("zoomVcut").value = String(Math.round(s.zoom_vcut));
+      $("zoomCLabel").textContent = Math.round(s.zoom_vcut) + " /s";
+    }
+    if (typeof s.lens_points === "number") lens.points = s.lens_points;
+    if (typeof s.lens_enabled === "boolean") lens.enabled = s.lens_enabled;
+    renderLensMeta();
   }
 
   function connect() {
@@ -358,25 +485,39 @@
   });
 
   // ---- Zoom (device-side trapezoidal ramp toward the target) ----
+  let lastZoomSent = -1;
   $("zoom").addEventListener("input", () => {
     zoomTouched = true;
-    $("zoomVal").textContent = $("zoom").value;
+    const pos = Math.max(1, Math.min(4095, Math.round(Number($("zoom").value))));
+    $("zoomVal").textContent = String(pos);
     clearTimeout(zoomTimer);
-    zoomTimer = setTimeout(() => {
-      send({ cmd: "zoom", position: Number($("zoom").value) });
-    }, 20);
+    const jump = lastZoomSent >= 0 && Math.abs(pos - lastZoomSent) > 48;
+    const fire = () => {
+      lastZoomSent = pos;
+      send({ cmd: "zoom", position: pos });
+    };
+    if (jump) fire();
+    else zoomTimer = setTimeout(fire, 20);
   });
 
   function sendZoomProfile() {
     $("zoomVLabel").textContent = $("zoomVmax").value + " /s";
     $("zoomALabel").textContent = $("zoomAccel").value + " /s²";
+    $("zoomCLabel").textContent = $("zoomVcut").value + " /s";
     clearTimeout(zoomProfileTimer);
     zoomProfileTimer = setTimeout(() => {
-      send({ cmd: "zoom_profile", vmax: Number($("zoomVmax").value), accel: Number($("zoomAccel").value) });
+      send({
+        cmd: "zoom_profile",
+        vmax: Number($("zoomVmax").value),
+        accel: Number($("zoomAccel").value),
+        vcut: Number($("zoomVcut").value),
+        decel: Number($("zoomAccel").value),
+      });
     }, 40);
   }
   $("zoomVmax").addEventListener("input", sendZoomProfile);
   $("zoomAccel").addEventListener("input", sendZoomProfile);
+  $("zoomVcut").addEventListener("input", sendZoomProfile);
 
   $("btnGoto").addEventListener("click", () => {
     send({
@@ -466,6 +607,7 @@
     }
     if (document.activeElement !== $("ptzInvPan")) $("ptzInvPan").checked = !!ptz.invert_pan;
     if (document.activeElement !== $("ptzInvTilt")) $("ptzInvTilt").checked = !!ptz.invert_tilt;
+    if (document.activeElement !== $("ptzInvZoom")) $("ptzInvZoom").checked = !!ptz.invert_zoom;
   }
 
   let ptzProfileTimer = null;
@@ -481,6 +623,7 @@
             max_rate: Number($("ptzRate").value),
             invert_pan: $("ptzInvPan").checked,
             invert_tilt: $("ptzInvTilt").checked,
+            invert_zoom: $("ptzInvZoom").checked,
           }),
         });
       } catch (e) { /* board not up */ }
@@ -489,6 +632,7 @@
   $("ptzRate").addEventListener("input", postPtzProfile);
   $("ptzInvPan").addEventListener("change", postPtzProfile);
   $("ptzInvTilt").addEventListener("change", postPtzProfile);
+  $("ptzInvZoom").addEventListener("change", postPtzProfile);
 
   async function pollStatus() {
     try {
@@ -514,6 +658,833 @@
     } catch (e) {
       hint.textContent = "probe request failed";
     }
+  });
+
+  // ---- Lens profile (motor counts <-> camera millimetres) ----
+  const WIDE_POS = 4095;
+  const IN_POS = 1;
+
+  function digitalMul(id) {
+    const el = $(id || "digitalMul");
+    const v = el ? Number(el.value) : 1;
+    if (!(v >= 1) || v > 2.5) return 1;
+    return v;
+  }
+
+  function syncDigitalMul(from, to) {
+    if ($(from) && $(to) && document.activeElement !== $(to)) $(to).value = $(from).value;
+  }
+
+  function fmtMm(v) {
+    return (typeof v === "number" && v > 0) ? v.toFixed(1) : "—";
+  }
+
+  function clampZoom(p) {
+    return Math.max(1, Math.min(4095, Math.round(p)));
+  }
+
+  function hideAsk() {
+    $("lensMmWrap").style.display = "none";
+    $("lensChoices").style.display = "none";
+    $("lensChoices").innerHTML = "";
+  }
+
+  function collectSamples() {
+    const rows = [];
+    const seen = new Set();
+    (lens.curves || []).forEach((c) => {
+      const band = c.band === 1 ? "digital" : "optical";
+      [].concat(c.out || [], c.in || []).forEach((p) => {
+        const key = band + ":" + p.pos + ":" + p.mm;
+        if (seen.has(key)) return;
+        seen.add(key);
+        rows.push({ pos: p.pos, mm: p.mm, band });
+      });
+    });
+    rows.sort((a, b) => b.pos - a.pos);
+    return rows;
+  }
+
+  function renderSampleTable() {
+    const rows = collectSamples();
+    const html = !rows.length
+      ? "<p class=\"hint\" style=\"margin:0\">No samples yet.</p>"
+      : "<table class=\"lens-table\"><thead><tr><th>Ring</th><th>mm</th><th>Band</th></tr></thead><tbody>" +
+        rows.map((r) => `<tr><td>${r.pos}</td><td>${fmtMm(r.mm)}</td><td>${r.band}</td></tr>`).join("") +
+        "</tbody></table>";
+    ["lensTable", "lensTableModal"].forEach((id) => {
+      if ($(id)) $(id).innerHTML = html;
+    });
+  }
+
+  function renderLensMeta() {
+    const n = lens.points || 0;
+    const nm = lens.name ? lens.name + " · " : "";
+    const range = (lens.wide && lens.tele) ? `${lens.wide}–${lens.tele} mm · ` : "";
+    const on = $("lensEnabled").checked;
+    let use = "table off";
+    if (on && n >= 2) use = "go-to uses table";
+    else if (on) use = "on, need ≥2 samples";
+    const ramp = lens.vmax
+      ? `T_max ${Math.round(lens.vmax)}/s · a ${Math.round(lens.accel)}/s² · min run ${Math.round(lens.vcut)}/s · `
+      : "";
+    if (n) {
+      $("lensMeta").textContent = `${nm}${range}${ramp}${n} sample${n === 1 ? "" : "s"} · ${use}`;
+    } else {
+      $("lensMeta").textContent = "No lens table yet. Map millimetres from the camera LCD.";
+    }
+    renderSampleTable();
+  }
+
+  async function loadLens() {
+    try {
+      const r = await fetch("/api/zoom/lens");
+      const body = await r.json();
+      lens.name = body.name || "";
+      lens.wide = body.wide_mm || 0;
+      lens.tele = body.tele_mm || 0;
+      lens.enabled = !!body.enabled;
+      lens.coupling = !!body.coupling;
+      lens.engageIn = body.engage_in || 0;
+      lens.engageOut = body.engage_out || 0;
+      lens.settle = body.settle_s || lens.settle;
+      lens.vmax = body.vmax || lens.vmax;
+      lens.accel = body.accel || lens.accel;
+      lens.decel = body.decel || lens.accel;
+      lens.vcut = body.vcut || 0;
+      lens.vstatic = body.vstatic || 0;
+      lens.repeatMm = body.repeat_mm || 0;
+      lens.curves = body.curves || [];
+      lens.in = body.in || [];
+      lens.out = body.out || [];
+      lens.points = body.count || ((lens.in.length + lens.out.length));
+      if (body.name && document.activeElement !== $("lensName")) $("lensName").value = body.name;
+      if (body.wide_mm && document.activeElement !== $("lensWide")) $("lensWide").value = body.wide_mm;
+      if (body.tele_mm && document.activeElement !== $("lensTele")) $("lensTele").value = body.tele_mm;
+      if (body.settle_s && document.activeElement !== $("lensSettle")) $("lensSettle").value = body.settle_s;
+      $("lensEnabled").checked = lens.enabled;
+      renderLensMeta();
+    } catch (e) { /* board not up */ }
+  }
+  loadLens();
+
+  function waitSettled(settleMs) {
+    return new Promise((resolve, reject) => {
+      const t0 = Date.now();
+      let stoppedAt = 0;
+      let sawMove = false;
+      const iv = setInterval(() => {
+        if (!calib.running) {
+          clearInterval(iv);
+          reject(new Error("cancelled"));
+          return;
+        }
+        if (Date.now() - t0 > 60000) {
+          clearInterval(iv);
+          reject(new Error("timeout"));
+          return;
+        }
+        if (calib.moving) {
+          stoppedAt = 0;
+          sawMove = true;
+          return;
+        }
+        if (!sawMove && Date.now() - t0 < 400) return;
+        if (!stoppedAt) stoppedAt = Date.now();
+        if (Date.now() - stoppedAt >= settleMs) {
+          clearInterval(iv);
+          resolve();
+        }
+      }, 50);
+    });
+  }
+
+  function askButtons(promptText, buttons) {
+    return new Promise((resolve, reject) => {
+      $("lensProgress").textContent = promptText;
+      $("lensMmWrap").style.display = "none";
+      const box = $("lensChoices");
+      box.innerHTML = "";
+      box.style.display = "flex";
+      const finish = (ok, val) => {
+        box.innerHTML = "";
+        box.style.display = "none";
+        if (!ok) reject(new Error("cancelled"));
+        else resolve(val);
+      };
+      calib._cancelAsk = () => finish(false);
+      buttons.forEach((b) => {
+        const el = document.createElement("button");
+        el.textContent = b.label;
+        if (b.primary) el.className = "primary big";
+        el.addEventListener("click", () => finish(true, b.value));
+        box.appendChild(el);
+      });
+    });
+  }
+
+  function readingFromFields() {
+    const v = Number($("lensMm").value);
+    const dx = digitalMul("lensDigitalMul");
+    if (!(v > 0)) return null;
+    const eq = v * (dx > 1.05 ? dx : 1);
+    return { optical_mm: v, digital_x: dx, equiv_mm: eq, visible: true };
+  }
+
+  function askReading(promptText, presetOpt, presetDx, opts) {
+    opts = opts || {};
+    return new Promise((resolve, reject) => {
+      $("lensProgress").textContent = promptText;
+      $("lensMmWrap").style.display = "flex";
+      $("lensMm").value = (presetOpt > 0) ? String(presetOpt) : "";
+      if (presetDx > 0) $("lensDigitalMul").value = String(presetDx);
+      $("lensMm").focus();
+      $("lensMm").select();
+      const box = $("lensChoices");
+      box.innerHTML = "";
+      box.style.display = "flex";
+      const finish = (ok, val) => {
+        $("lensMmGo").removeEventListener("click", onGo);
+        $("lensMm").removeEventListener("keydown", onKey);
+        box.innerHTML = "";
+        box.style.display = "none";
+        $("lensMmWrap").style.display = "none";
+        if (!ok) reject(new Error("cancelled"));
+        else resolve(val);
+      };
+      const onGo = () => {
+        const r = readingFromFields();
+        if (!r) return;
+        calib.lastReading = r;
+        finish(true, r);
+      };
+      const onKey = (ev) => {
+        if (ev.key === "Enter") { ev.preventDefault(); onGo(); }
+      };
+      calib._cancelAsk = () => finish(false);
+      $("lensMmGo").addEventListener("click", onGo);
+      $("lensMm").addEventListener("keydown", onKey);
+      if (opts.allowSame && calib.lastReading && calib.lastReading.optical_mm > 0) {
+        const same = document.createElement("button");
+        same.textContent = "Same as last (" + fmtMm(calib.lastReading.equiv_mm || calib.lastReading.optical_mm) + " mm)";
+        same.addEventListener("click", () => finish(true, Object.assign({ same: true }, calib.lastReading)));
+        box.appendChild(same);
+      }
+      if (opts.allowSkip) {
+        const skip = document.createElement("button");
+        skip.textContent = "Skip this point";
+        skip.addEventListener("click", () => finish(true, { skip: true }));
+        box.appendChild(skip);
+      }
+    });
+  }
+
+  async function postLens(body) {
+    const r = await fetch("/api/zoom/lens", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error("lens");
+    await loadLens();
+  }
+
+  async function postSample(mm, pos, dir, vmax, accel, band) {
+    const body = { mm };
+    if (typeof pos === "number") body.pos = pos;
+    if (typeof dir === "number") body.dir = dir;
+    body.vmax = vmax != null ? vmax : Number($("zoomVmax").value);
+    body.accel = accel != null ? accel : Number($("zoomAccel").value);
+    body.band = band || 0;
+    const r = await fetch("/api/zoom/lens/sample", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error("sample");
+    await loadLens();
+  }
+
+  async function holdZoom() {
+    send({ cmd: "zoom_hold" });
+    try {
+      const r = await fetch("/api/zoom/hold", { method: "POST" });
+      const b = await r.json();
+      if (typeof b.position === "number") {
+        zoomPosNow = b.position;
+        return b.position;
+      }
+    } catch (e) { /* fall through */ }
+    return zoomPosNow;
+  }
+
+  async function moveZoomTo(pos, label) {
+    $("lensProgress").textContent = label || (`Moving ring to ${pos}…`);
+    hideAsk();
+    send({ cmd: "zoom", position: pos });
+    await waitSettled(calib.settleMs);
+  }
+
+  function mmToMotor(mm, wideMm, fullMm) {
+    const t = (Number(mm) - wideMm) / Math.max(0.5, fullMm - wideMm);
+    const u = Math.max(0, Math.min(1, t));
+    return clampZoom(WIDE_POS - u * (WIDE_POS - IN_POS));
+  }
+
+  function designatedMapPoints(steps, wideMm, teleMm, digital, minGap) {
+    const digi = Math.max(1, Number(digital) || 1);
+    const fullMm = teleMm * (digi > 1.05 ? digi : 1);
+    const n = Math.max(4, Math.min(12, steps | 0));
+    const gap = Math.max(16, minGap || 16);
+    const wanted = [];
+    const addMm = (mm) => {
+      const v = Math.round(Number(mm) * 10) / 10;
+      if (!(v > 0)) return;
+      if (wanted.some((x) => Math.abs(x - v) < 0.4)) return;
+      wanted.push(v);
+    };
+    addMm(wideMm);
+    addMm(teleMm * 0.5);
+    addMm(teleMm);
+    if (digi > 1.05) addMm(teleMm * digi);
+    while (wanted.length < n) {
+      wanted.sort((a, b) => a - b);
+      let bestI = 0, bestGap = 0;
+      for (let i = 0; i < wanted.length - 1; i++) {
+        const g = wanted[i + 1] - wanted[i];
+        if (g > bestGap) {
+          bestGap = g;
+          bestI = i;
+        }
+      }
+      if (bestGap < 0.8) break;
+      addMm((wanted[bestI] + wanted[bestI + 1]) / 2);
+    }
+    wanted.sort((a, b) => a - b);
+    const points = [];
+    for (const mm of wanted) {
+      const pos = mmToMotor(mm, wideMm, fullMm);
+      const home = Math.abs(mm - wideMm) < 0.4;
+      if (!home && points.some((p) => Math.abs(p.pos - pos) < gap)) continue;
+      points.push({ pos, aimMm: mm, home, digital: mm > teleMm + 0.3 });
+    }
+    return points;
+  }
+
+  function applyMotion(vmax, accel, vrun, decel) {
+    const d = (decel == null) ? accel : decel;
+    send({ cmd: "zoom_profile", vmax, accel, vcut: vrun || 0, decel: d });
+  }
+
+  function restoreCalibActions() {
+    $("lensSetup").style.display = "";
+    $("lensStart").style.display = "";
+    $("lensChar").style.display = "";
+    $("lensStart").textContent = "Map millimetres";
+    $("lensChar").textContent = "Characterize speeds";
+    $("lensStart").disabled = false;
+    $("lensTitle").textContent = "Lens calibration";
+    hideAsk();
+  }
+
+  async function confirmEndpoint(kind, landed, wantOpt, wantDx) {
+    for (;;) {
+      if (!calib.running) throw new Error("cancelled");
+      const r = await askReading(
+        kind === "wide"
+          ? `Fully out. Ring ${landed}. Type the LCD millimetres (want ${fmtMm(wantOpt)}). Overlay gone: rocker a hair to refresh it, then type.`
+          : `Fully in. Ring ${landed}. Type optical mm and digital × (want ${fmtMm(wantOpt)} ×${wantDx.toFixed(1)}).`,
+        wantOpt,
+        kind === "wide" ? 1 : wantDx,
+        { allowSame: false }
+      );
+      if (r.skip) continue;
+      const opt = r.optical_mm;
+      const dx = r.digital_x || 1;
+      if (kind === "wide") {
+        if (opt <= wantOpt + 2) return { pos: landed, mm: opt, reading: r };
+        await askButtons(
+          `The ring is already at the wide stop (${landed}) but you typed ${fmtMm(opt)} mm, not ${fmtMm(wantOpt)} mm. Power-zoom OUT on the camera until the LCD shows ${fmtMm(wantOpt)} mm. Leave the gimbal ring where it is.`,
+          [{ value: "ok", label: "I power-zoomed — type the LCD next", primary: true }]
+        );
+      } else {
+        if (opt >= wantOpt - 2 && dx >= wantDx - 0.08) {
+          return { pos: landed, mm: opt * (dx > 1.05 ? dx : 1), reading: r };
+        }
+        await askButtons(
+          `The ring is already at the tele stop (${landed}) but you typed ${fmtMm(opt)} mm ×${dx.toFixed(1)} (want ${fmtMm(wantOpt)} ×${wantDx.toFixed(1)}). Power-zoom IN until optical tele and ${wantDx.toFixed(1)}× digital. Leave the gimbal ring where it is.`,
+          [{ value: "ok", label: "I power-zoomed — type the LCD next", primary: true }]
+        );
+      }
+    }
+  }
+
+  async function homeWide(wideMm, vmax, accel, first, record) {
+    $("lensProgress").textContent = `Reset to fully out (want ${fmtMm(wideMm)} mm)…`;
+    await moveZoomTo(WIDE_POS, `Motor fully out (${WIDE_POS})…`);
+    const landed = await holdZoom();
+    let end;
+    if (first) {
+      end = await confirmEndpoint("wide", landed, wideMm, 1);
+    } else {
+      const ans = await askButtons(
+        `Back at fully out (ring ${landed}). Is the LCD ${fmtMm(wideMm)} mm? If the overlay is gone, rocker a hair on the camera so it comes back — do not use the gimbal ring.`,
+        [
+          { value: "yes", label: `Yes — ${fmtMm(wideMm)} mm`, primary: true },
+          { value: "fix", label: "No — I'll type it" },
+        ]
+      );
+      if (ans === "yes") {
+        end = {
+          pos: landed,
+          mm: wideMm,
+          reading: { optical_mm: wideMm, digital_x: 1, equiv_mm: wideMm, visible: true },
+        };
+        calib.lastReading = end.reading;
+      } else {
+        end = await confirmEndpoint("wide", landed, wideMm, 1);
+      }
+    }
+    if (record !== false && vmax != null) await postSample(end.mm, end.pos, 0, vmax, accel, 0);
+    return end;
+  }
+
+  function readingEq(r) {
+    if (!r) return 0;
+    const o = Number(r.optical_mm) || 0;
+    const d = Number(r.digital_x) || 1;
+    return o * (d > 1.05 ? d : 1);
+  }
+
+  function mmMoved(a, b) {
+    return Math.abs(Number(a) - Number(b)) >= 0.35;
+  }
+
+  function mmStats(arr) {
+    const xs = arr.map(Number).filter((x) => x > 0);
+    if (!xs.length) return { n: 0, range: 99, mean: 0 };
+    const lo = Math.min.apply(null, xs);
+    const hi = Math.max.apply(null, xs);
+    const mean = xs.reduce((a, b) => a + b, 0) / xs.length;
+    return { n: xs.length, range: hi - lo, mean };
+  }
+
+  async function askChanged(prompt) {
+    const ans = await askButtons(prompt, [
+      { value: "yes", label: "Yes — millimetres changed", primary: true },
+      { value: "no", label: "No change" },
+      { value: "type", label: "I'll type the LCD" },
+    ]);
+    if (ans === "type") {
+      const prev = calib.lastReading;
+      const r = await askReading(
+        "Type the LCD millimetres.",
+        prev && prev.optical_mm,
+        (prev && prev.digital_x) || 1,
+        { allowSame: true }
+      );
+      const changed = !prev || mmMoved(readingEq(prev), readingEq(r));
+      calib.lastReading = r;
+      return { changed, reading: r };
+    }
+    return { changed: ans === "yes" };
+  }
+
+  async function runPhase1() {
+    const savedV = Number($("zoomVmax").value);
+    const savedA = Number($("zoomAccel").value);
+    const wide = Number($("lensWide").value) || 18;
+    const tele = Number($("lensTele").value) || 105;
+    const name = ($("lensName").value || "lens").slice(0, 23);
+    const tol = Math.max(0.1, Number($("lensTol").value) || 0.5);
+    const repeats = Math.max(2, Math.min(4, Number($("lensRepeats").value) || 2));
+    const PARK = 2048;
+    const TEST = 1024;
+    const JOG = 250;
+    calib.settleMs = Math.round(Number($("lensSettle").value) * 1000) || 2000;
+    calib.running = true;
+    calib.lastReading = null;
+    $("lensSetup").style.display = "none";
+    $("lensStart").style.display = "none";
+    $("lensChar").style.display = "none";
+    $("lensTitle").textContent = "Characterize speeds";
+    try {
+      await fetch("/api/zoom/lens/enable", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: false }),
+      });
+      await askButtons(
+        "The motor will jog. After each move, say whether the LCD millimetres changed. Type them when we check repeatability. We pick the fastest cruise that lands within ±" +
+          tol.toFixed(1) + " mm.",
+        [{ value: "ok", label: "Start", primary: true }]
+      );
+
+      await homeWide(wide, null, null, true, false);
+
+      let tryV = 80;
+      const tryA = 700;
+      applyMotion(tryV, tryA, 0, tryA);
+      await moveZoomTo(PARK, "Parking mid-ring to find the slowest command that actually zooms…");
+      let last = await askReading("Parked. Type the LCD millimetres.", 0, 1, { allowSame: false });
+      calib.lastReading = last;
+      let lastMm = readingEq(last);
+      let tStatic = 0;
+      for (let n = 0; n < 10; n++) {
+        applyMotion(tryV, tryA, 0, tryA);
+        const dest = clampZoom(PARK - JOG);
+        await moveZoomTo(dest, `Jog ${JOG} in at ${Math.round(tryV)}/s from rest…`);
+        const ch = await askChanged(`From rest at ${Math.round(tryV)}/s. Was ${fmtMm(lastMm)} mm. Did millimetres change?`);
+        if (ch.reading) lastMm = readingEq(ch.reading);
+        if (ch.changed) {
+          tStatic = tryV;
+          break;
+        }
+        await moveZoomTo(PARK, "No zoom — parking to try a faster command…");
+        tryV = Math.min(1200, Math.round(tryV * 1.25));
+      }
+      if (!tStatic) throw new Error("Ring never moved. Try motor calib, F mode, or a bigger jog.");
+
+      let tRun = tStatic;
+      let okStreak = 0;
+      for (let n = 0; n < 6 && okStreak < 2; n++) {
+        applyMotion(tRun, tryA, 0, tryA);
+        await moveZoomTo(PARK, `Min-run check at ${Math.round(tRun)}/s…`);
+        await moveZoomTo(clampZoom(PARK - JOG), `Repeat jog at ${Math.round(tRun)}/s…`);
+        const ch = await askChanged(`Jog at ${Math.round(tRun)}/s. Did millimetres change?`);
+        if (ch.reading) lastMm = readingEq(ch.reading);
+        if (ch.changed) okStreak += 1;
+        else {
+          okStreak = 0;
+          tRun = Math.min(1600, Math.round(tRun * 1.2));
+        }
+      }
+      $("zoomVcut").value = String(Math.round(tRun));
+      $("zoomCLabel").textContent = Math.round(tRun) + " /s";
+
+      const lo = Math.max(90, Math.round(tRun * 1.15));
+      const hi = 2200;
+      const ladder = [
+        { name: "slow", vmax: lo },
+        { name: "medium", vmax: Math.round(lo * Math.pow(hi / lo, 0.5)) },
+        { name: "fast", vmax: hi },
+      ];
+      const medA = Math.max(400, Math.round(tRun * 2));
+      const speedRows = [];
+      $("lensTitle").textContent = "Cruise repeatability";
+      for (let s = 0; s < ladder.length; s++) {
+        const step = ladder[s];
+        applyMotion(step.vmax, medA, tRun, medA);
+        const samples = [];
+        for (let r = 0; r < repeats; r++) {
+          await homeWide(wide, null, null, false, false);
+          await moveZoomTo(TEST, `${step.name}: long move to ring ${TEST} at ${Math.round(step.vmax)}/s (${r + 1}/${repeats})…`);
+          const landed = await holdZoom();
+          const got = await askReading(
+            `${step.name} ${Math.round(step.vmax)}/s repeat ${r + 1}/${repeats} (ring ${landed}). Type the LCD.`,
+            0, 1, { allowSame: false }
+          );
+          calib.lastReading = got;
+          samples.push(readingEq(got));
+        }
+        const st = mmStats(samples);
+        speedRows.push({ ...step, samples, st, pass: st.range <= tol });
+        $("lensProgress").textContent =
+          `${step.name} ${Math.round(step.vmax)}/s → ${samples.map(fmtMm).join(", ")} mm (spread ${st.range.toFixed(2)}).`;
+        if (!speedRows[s].pass && s >= 1) break;
+      }
+      let chosen = null;
+      for (let i = speedRows.length - 1; i >= 0; i--) {
+        if (speedRows[i].pass) { chosen = speedRows[i]; break; }
+      }
+      if (!chosen) chosen = speedRows.slice().sort((a, b) => a.st.range - b.st.range)[0];
+      const tMax = chosen.vmax;
+
+      $("lensTitle").textContent = "Accel repeatability";
+      const accels = [
+        { name: "gentle", a: Math.max(400, Math.round(tMax * 2)) },
+        { name: "snappy", a: Math.max(800, Math.round(tMax * 5)) },
+      ];
+      const accelRows = [];
+      for (let s = 0; s < accels.length; s++) {
+        const step = accels[s];
+        applyMotion(tMax, step.a, tRun, step.a);
+        const samples = [];
+        for (let r = 0; r < repeats; r++) {
+          await homeWide(wide, null, null, false, false);
+          await moveZoomTo(TEST, `${step.name} ${Math.round(step.a)}/s² (${r + 1}/${repeats})…`);
+          const landed = await holdZoom();
+          const got = await askReading(
+            `${step.name} ${Math.round(step.a)}/s² repeat ${r + 1}/${repeats} (ring ${landed}). Type the LCD.`,
+            0, 1, { allowSame: false }
+          );
+          calib.lastReading = got;
+          samples.push(readingEq(got));
+        }
+        const st = mmStats(samples);
+        accelRows.push({ ...step, samples, st, pass: st.range <= tol });
+      }
+      const passedA = accelRows.filter((r) => r.pass);
+      const pool = (passedA.length ? passedA : accelRows).slice().sort((a, b) => (a.st.range - b.st.range) || (b.a - a.a));
+      const aCanon = pool[0].a;
+      const repeatMm = Math.max(chosen.st.range, pool[0].st.range);
+
+      $("lensTitle").textContent = "Trigger distance";
+      async function measureEngage(dir) {
+        const toward = dir < 0 ? "in (tele)" : "out (wide)";
+        await moveZoomTo(PARK, `Trigger ${toward}: parking, then small steps.`);
+        const parked = await askReading(`Mid-ring. Type LCD before stepping ${toward}.`, lastMm, 1, { allowSame: true });
+        const mm0 = readingEq(parked);
+        calib.lastReading = parked;
+        const origin = zoomPosNow;
+        let step = 40;
+        let travelled = 0;
+        for (let i = 0; i < 12; i++) {
+          travelled += step;
+          const dest = clampZoom(origin + dir * travelled);
+          await moveZoomTo(dest, `Trigger ${toward}: ${Math.abs(dest - origin)} counts…`);
+          const ch = await askChanged(`After ${Math.abs(dest - origin)} counts ${toward}. Did millimetres change from ${fmtMm(mm0)}?`);
+          if (ch.changed) return Math.max(16, Math.round(Math.abs(dest - origin) * 1.08));
+          step = Math.min(Math.round(step * 1.35), 120);
+        }
+        throw new Error("Millimetres never changed " + toward);
+      }
+      const engIn = await measureEngage(-1);
+      const engOut = await measureEngage(1);
+
+      applyMotion(tMax, aCanon, tRun, aCanon);
+      $("zoomVmax").value = String(Math.round(tMax));
+      $("zoomVLabel").textContent = Math.round(tMax) + " /s";
+      $("zoomAccel").value = String(Math.round(aCanon));
+      $("zoomALabel").textContent = Math.round(aCanon) + " /s²";
+
+      await postLens({
+        name, wide_mm: wide, tele_mm: tele,
+        coupling: true,
+        engage_in: engIn,
+        engage_out: engOut,
+        settle_s: Number($("lensSettle").value) || 2,
+        vmax: tMax,
+        accel: aCanon,
+        decel: aCanon,
+        vcut: tRun,
+        vstatic: tStatic,
+        repeat_mm: repeatMm,
+        enabled: false,
+      });
+      $("lensTitle").textContent = "Speeds saved";
+      hideAsk();
+      $("lensProgress").textContent =
+        `Min-run ${Math.round(tRun)}/s · cruise ${Math.round(tMax)}/s · accel ${Math.round(aCanon)}/s² · ` +
+        `repeatability ${repeatMm.toFixed(2)} mm · trigger in ${engIn} / out ${engOut}. Next: map millimetres.`;
+      restoreCalibActions();
+    } catch (e) {
+      send({ cmd: "zoom_profile", vmax: savedV, accel: savedA });
+      if (e && e.message === "cancelled") {
+        closeCalib(false);
+        return;
+      }
+      restoreCalibActions();
+      $("lensProgress").textContent = (e && e.message) ? String(e.message) : "Stopped.";
+    } finally {
+      calib.running = false;
+    }
+  }
+
+  async function runMap() {
+    const savedV = Number($("zoomVmax").value);
+    const savedA = Number($("zoomAccel").value);
+    const wide = Number($("lensWide").value) || 18;
+    const tele = Number($("lensTele").value) || 105;
+    const digi = Math.max(1, Number($("lensDigi").value) || digitalMul("digitalMul"));
+    const name = ($("lensName").value || "lens").slice(0, 23);
+    const steps = Number($("lensSteps").value) || 7;
+    const vmax = Number($("zoomVmax").value);
+    const accel = Number($("zoomAccel").value);
+    const vcut = Number($("zoomVcut").value);
+    $("lensDigitalMul").value = "1";
+    $("digitalMul").value = String(digi);
+    calib.settleMs = Math.round(Number($("lensSettle").value) * 1000) || 2000;
+    calib.running = true;
+    calib.lastReading = null;
+    $("lensSetup").style.display = "none";
+    $("lensStart").style.display = "none";
+    $("lensChar").style.display = "none";
+    $("lensTitle").textContent = "Map millimetres";
+    try {
+      const useV = lens.coupling && lens.vmax ? lens.vmax : vmax;
+      const useA = lens.coupling && lens.accel ? lens.accel : accel;
+      const useC = lens.coupling && lens.vcut ? lens.vcut : vcut;
+      const engIn = lens.coupling && lens.engageIn ? lens.engageIn : 80;
+      const engOut = lens.coupling && lens.engageOut ? lens.engageOut : 80;
+      await postLens({
+        name, wide_mm: wide, tele_mm: tele,
+        vmax: useV, accel: useA, decel: useA, vcut: useC,
+        coupling: true,
+        engage_in: engIn,
+        engage_out: engOut,
+        settle_s: Number($("lensSettle").value) || 2,
+        enabled: false,
+      });
+      applyMotion(useV, useA, useC, useA);
+      await fetch("/api/zoom/lens/clear", { method: "POST" });
+      await loadLens();
+
+      $("lensTitle").textContent = "Wide stop";
+      await homeWide(wide, useV, useA, true);
+
+      $("lensTitle").textContent = "Tele stop";
+      await moveZoomTo(IN_POS, `Motor fully in (${IN_POS})…`);
+      const teleLand = await holdZoom();
+      const teleEnd = await confirmEndpoint("tele", teleLand, tele, digi);
+      const teleBand = teleEnd.mm > tele + 0.35 ? 1 : 0;
+      await postSample(teleEnd.mm, teleEnd.pos, 0, useV, useA, teleBand);
+
+      const points = designatedMapPoints(steps, wide, tele, digi, Math.max(engIn, engOut, 80))
+        .filter((pt) => !pt.home && Math.abs(pt.pos - IN_POS) > 24);
+      for (let i = 0; i < points.length; i++) {
+        if (!calib.running) throw new Error("cancelled");
+        const pt = points[i];
+        const band = pt.digital ? 1 : 0;
+        $("lensTitle").textContent = `Point ${i + 1} of ${points.length}`;
+        await homeWide(wide, useV, useA, false);
+        await moveZoomTo(
+          pt.pos,
+          pt.digital
+            ? `Digital · toward ~${fmtMm(pt.aimMm)} mm (ring ${pt.pos})…`
+            : `Optical · toward ~${fmtMm(pt.aimMm)} mm (ring ${pt.pos})…`
+        );
+        const landed = await holdZoom();
+        const got = await askReading(
+          `Ring ${landed}. Aimed ~${fmtMm(pt.aimMm)} mm. Type the LCD (optical mm, and × if digital is showing). Overlay gone: rocker a hair to refresh, then type. Same as last only if millimetres never changed.`,
+          pt.digital ? tele : pt.aimMm,
+          pt.digital ? digi : 1,
+          { allowSame: true, allowSkip: true }
+        );
+        if (got.skip) continue;
+        const mm = band === 1 ? got.equiv_mm : got.optical_mm;
+        await postSample(mm, landed, 0, useV, useA, band);
+      }
+
+      await postLens({ name, wide_mm: wide, tele_mm: tele, enabled: true });
+      await fetch("/api/zoom/lens/enable", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: true }),
+      });
+      await loadLens();
+      applyMotion(useV, useA, useC, useA);
+      $("lensTitle").textContent = "Table saved";
+      hideAsk();
+      $("lensProgress").textContent =
+        "Go-to millimetres now uses this table and the speed sliders. Add extra rows anytime with Camera shows → Record.";
+      $("lensSetup").style.display = "";
+      $("lensStart").style.display = "";
+      $("lensChar").style.display = "";
+      $("lensStart").textContent = "Close";
+    } catch (e) {
+      send({ cmd: "zoom_profile", vmax: savedV, accel: savedA });
+      if (e && e.message === "cancelled") {
+        closeCalib(false);
+        return;
+      }
+      restoreCalibActions();
+      $("lensProgress").textContent = (e && e.message) ? String(e.message) : "Stopped.";
+    } finally {
+      calib.running = false;
+    }
+  }
+
+  function openCalib() {
+    syncDigitalMul("digitalMul", "lensDigi");
+    $("lensModal").classList.add("open");
+    restoreCalibActions();
+    $("lensProgress").textContent = lens.coupling
+      ? (lens.points
+        ? `Speeds saved (cruise ${Math.round(lens.vmax)}/s). Map millimetres, or characterize again.`
+        : `Speeds saved (cruise ${Math.round(lens.vmax)}/s · min-run ${Math.round(lens.vcut)}/s). Next: map millimetres.`)
+      : "Characterize speeds first so every millimetre sample uses the same profile. Mapping can skip and use the sliders.";
+    renderSampleTable();
+  }
+
+  function closeCalib(cancelAsk) {
+    calib.running = false;
+    if (cancelAsk && calib._cancelAsk) calib._cancelAsk();
+    $("lensModal").classList.remove("open");
+    restoreCalibActions();
+  }
+
+  function startMap() {
+    if ($("lensStart").textContent === "Close") {
+      closeCalib(false);
+      return;
+    }
+    if (calib.running) return;
+    if (!lens.coupling) {
+      if (!confirm("Speeds are not characterized yet. Map using the current speed / accel / min-run sliders?")) return;
+    }
+    runMap();
+  }
+
+  function startChar() {
+    if (calib.running) return;
+    runPhase1();
+  }
+
+  $("digitalMul").addEventListener("input", () => syncDigitalMul("digitalMul", "lensDigi"));
+  $("lensDigi").addEventListener("input", () => syncDigitalMul("lensDigi", "digitalMul"));
+
+  $("btnLensCalib").addEventListener("click", openCalib);
+  $("lensCancel").addEventListener("click", () => closeCalib(true));
+  $("lensStart").addEventListener("click", startMap);
+  $("lensChar").addEventListener("click", startChar);
+
+  $("btnZoomMm").addEventListener("click", () => {
+    const mm = Number($("zoomMm").value);
+    if (!(mm > 0)) return;
+    if (!lens.enabled || lens.points < 2) {
+      $("lensMeta").textContent = "Go-to millimetres needs a mapped table with Use lens table checked.";
+      return;
+    }
+    send({ cmd: "zoom", mm });
+  });
+  $("zoomMm").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") $("btnZoomMm").click();
+  });
+
+  $("btnRecordMm").addEventListener("click", async () => {
+    const opt = Number($("recordMm").value);
+    const dx = digitalMul("digitalMul");
+    const mm = opt * (dx > 1.05 ? dx : 1);
+    if (!(mm > 0)) return;
+    try {
+      await postSample(mm, zoomPosNow, 0, undefined, undefined, mm > (lens.tele || 0) + 0.35 ? 1 : 0);
+      $("recordMm").value = "";
+    } catch (e) {
+      $("lensMeta").textContent = "Record failed.";
+    }
+  });
+  $("recordMm").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") $("btnRecordMm").click();
+  });
+
+  $("lensEnabled").addEventListener("change", async () => {
+    try {
+      await fetch("/api/zoom/lens/enable", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: $("lensEnabled").checked }),
+      });
+      await loadLens();
+    } catch (e) { /* ignore */ }
+  });
+
+  $("btnLensClear").addEventListener("click", async () => {
+    if (!confirm("Clear the millimetre table?")) return;
+    try {
+      await fetch("/api/zoom/lens/clear", { method: "POST" });
+      await loadLens();
+    } catch (e) { /* ignore */ }
   });
 })();
 </script>
