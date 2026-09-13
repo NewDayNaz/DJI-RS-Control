@@ -38,6 +38,8 @@
 #include "dji_can_protocol.h"
 #include "can_hw.h"
 #include "ptz_bridge.h"
+#include "zoom_lens.h"
+#include "zoom_ramp.h"
 
 // GIMBAL_SLEEP_ENABLED gates the battery-power-management block below (presence sensing +
 // deep sleep) — see README.md "Power Management". The Seeed CAN hat uses D6–D10 (INT/CS/SPI)
@@ -72,11 +74,19 @@ static constexpr uint32_t PUSH_STALE_MS = 350;      // PUSH_STALE_S = 0.35
 static constexpr uint32_t STATE_BROADCAST_MS = 50;  // golden web streams snapshot at 20 Hz
 static constexpr uint32_t OFF_TIMEOUT_MS = 60000;   // deep-sleep after this long unplugged
 
-// ---- Zoom ramp limits (dji_can_session.py) ----
-static constexpr float ZOOM_MIN = 0.0f;
-static constexpr float ZOOM_MAX = 4096.0f;
+// ---- Zoom ramp limits (src/zoom_ramp.h; golden session used 0–4096) ----
+// Documented motor-calib span is 0–4096, but the gimbal ignores those exact
+// endpoints (0 = empty, 4096 does not fit in 12 bits). Treat them as 1 / 4095.
+static constexpr float ZOOM_MIN = zoom::kMin;
+static constexpr float ZOOM_MAX = zoom::kMax;
 static constexpr float ZOOM_VMAX_DEFAULT = 900.0f;
-static constexpr float ZOOM_ACCEL_DEFAULT = 1800.0f;
+static constexpr float ZOOM_ACCEL_DEFAULT = 4500.0f;
+// Below this speed the power-zoom ring typically does not track. Ease down
+// to this floor, then stop — do not crawl to zero through the dead zone.
+static constexpr float ZOOM_VCUT_DEFAULT = 120.0f;
+// PTZ zoom/focus rockers use this multiplier so ease-in/coast are ~half the
+// slider/preset ramp time (stopDist and time-to-vmax both scale with 1/accel).
+static constexpr float ZOOM_PTZ_ACCEL_MUL = 2.0f;
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
@@ -100,7 +110,7 @@ struct SessionState {
     uint32_t lastPushMs = 0; // last 0x08 push specifically
     uint32_t rxOk = 0;
 
-    // zoom (focus motor position, 0-4096) with trapezoidal ramp
+    // zoom (focus motor position, 1-4095; 0→1, 4096→4095) with trapezoidal ramp
     bool haveZoomCmd = false;    // false until seeded by the first focus reply
     float zoomCmd = 0.0f;
     float zoomVel = 0.0f;
@@ -112,8 +122,12 @@ struct SessionState {
     bool haveZoomReported = false;
     float zoomVmax = ZOOM_VMAX_DEFAULT;
     float zoomAccel = ZOOM_ACCEL_DEFAULT;
+    float zoomDecel = ZOOM_ACCEL_DEFAULT;
+    float zoomVcut = ZOOM_VCUT_DEFAULT;
     bool zoomRateActive = false;
     float zoomRateSigned = 0.0f;
+    bool zoomPtzBoost = false;
+    int8_t zoomLastDir = 0;      // last non-zero motor travel, for lens hysteresis
 
     // Who last took the speed hold. WS uses a 250 ms deadman; PTZ protocols
     // send an explicit stop (VISCA/Pelco/AW semantics) so they must not be
@@ -260,43 +274,12 @@ static bool canSendPacket(const std::vector<uint8_t> &pkt) {
 }
 
 // ---------------------------------------------------------------------------
-// Zoom ramp — direct port of zoom_ramp_step() in dji_can_session.py.
+// Zoom ramp — src/zoom_ramp.h (firmware + host tests share one implementation).
 // ---------------------------------------------------------------------------
 
-static bool zoomRampStep(float &pos, float &vel, float target, float vmax, float accel, float dt) {
-    vmax = fmaxf(1.0f, vmax);
-    accel = fmaxf(1.0f, accel);
-    dt = fminf(fmaxf(dt, 0.0f), 0.1f);
-    float remaining = target - pos;
-    if (fabsf(remaining) < 0.5f && fabsf(vel) < 8.0f) {
-        pos = target;
-        vel = 0.0f;
-        return true;
-    }
-    if (dt <= 0.0f) return false;
-
-    float want = remaining > 0.0f ? 1.0f : -1.0f;
-    float stopDist = (vel * vel) / (2.0f * accel);
-    float acc;
-    if (vel * remaining < 0.0f) {
-        acc = -copysignf(accel, vel);
-    } else if (stopDist >= fabsf(remaining)) {
-        acc = fabsf(vel) > 1e-6f ? -copysignf(accel, vel) : 0.0f;
-    } else if (fabsf(vel) < vmax) {
-        acc = want * accel;
-    } else {
-        acc = 0.0f;
-        vel = copysignf(vmax, vel);
-    }
-
-    vel = fmaxf(-vmax, fminf(vmax, vel + acc * dt));
-    pos = pos + vel * dt;
-    if ((remaining > 0.0f && pos >= target) || (remaining < 0.0f && pos <= target)) {
-        pos = target;
-        vel = 0.0f;
-        return true;
-    }
-    return false;
+static bool zoomRampStep(float &pos, float &vel, float target, float vmax,
+                         float accel, float dt, float vcut, float decel) {
+    return zoom::rampStep(pos, vel, target, vmax, accel, dt, vcut, decel);
 }
 
 // Mirrors GimbalCanSession._tick_zoom: advance the ramp at ZOOM_HZ and transmit
@@ -315,26 +298,37 @@ static void tickZoom(uint32_t now) {
     float target = g_s.zoomTarget;
     float vmax = g_s.zoomVmax;
     float accel = g_s.zoomAccel;
+    float decel = g_s.zoomDecel >= 50.0f ? g_s.zoomDecel : g_s.zoomAccel;
+    float vcut = g_s.zoomVcut;
+    if (g_s.zoomRateActive || g_s.zoomPtzBoost) {
+        accel *= ZOOM_PTZ_ACCEL_MUL;
+        decel *= ZOOM_PTZ_ACCEL_MUL;
+    }
     if (g_s.zoomRateActive) {
         vmax *= fmaxf(0.05f, fabsf(g_s.zoomRateSigned));
         target = g_s.zoomRateSigned > 0.0f ? ZOOM_MAX : ZOOM_MIN;
     }
-    bool arrived = zoomRampStep(pos, vel, target, vmax, accel, dt);
+    bool arrived = zoomRampStep(pos, vel, target, vmax, accel, dt, vcut, decel);
     pos = fmaxf(ZOOM_MIN, fminf(ZOOM_MAX, pos));
     int commanded = (int) lroundf(pos);
+    if (commanded < (int) ZOOM_MIN) commanded = (int) ZOOM_MIN;
+    if (commanded > (int) ZOOM_MAX) commanded = (int) ZOOM_MAX;
+    int wire = commanded;
+    if (fabsf(vel) > 8.0f) g_s.zoomLastDir = vel > 0.0f ? 1 : -1;
     g_s.zoomCmd = pos;
     g_s.zoomVel = arrived ? 0.0f : vel;
+    if (arrived) g_s.zoomPtzBoost = false;
     g_s.zoomReported = commanded;
     g_s.haveZoomReported = true;
-    bool needSend = !g_s.haveZoomSent || commanded != g_s.zoomSent;
+    bool needSend = !g_s.haveZoomSent || wire != g_s.zoomSent;
     if (needSend) {
-        g_s.zoomSent = commanded;
+        g_s.zoomSent = wire;
         g_s.haveZoomSent = true;
     }
     xSemaphoreGive(g_stateLock);
 
     if (needSend) {
-        canSendPacket(dji::buildFocusSet((uint16_t) commanded));
+        canSendPacket(dji::buildFocusSet((uint16_t) wire));
     }
 }
 
@@ -412,29 +406,174 @@ static void tickAnglePoll(uint32_t now) {
 // Zoom / command API (called from WS and REST handlers)
 // ---------------------------------------------------------------------------
 
+static int currentZoomPosLocked() {
+    if (g_s.haveZoomReported) return g_s.zoomReported;
+    if (g_s.haveZoomCmd) return (int) lroundf(g_s.zoomCmd);
+    return 0;
+}
+
+static void setLiveRamp(float vmax, float accel, float vcut = -1.0f, float decel = -1.0f) {
+    xSemaphoreTake(g_stateLock, portMAX_DELAY);
+    g_s.zoomVmax = fmaxf(50.0f, fminf(8000.0f, vmax));
+    g_s.zoomAccel = fmaxf(50.0f, fminf(40000.0f, accel));
+    if (decel >= 50.0f) {
+        g_s.zoomDecel = fmaxf(50.0f, fminf(40000.0f, decel));
+    } else {
+        g_s.zoomDecel = g_s.zoomAccel;
+    }
+    if (vcut >= 0.0f) {
+        g_s.zoomVcut = fmaxf(0.0f, fminf(g_s.zoomVmax * 0.9f, vcut));
+    }
+    xSemaphoreGive(g_stateLock);
+}
+
 static void setZoomTarget(int position) {
     float pos = (float) constrain(position, (int) ZOOM_MIN, (int) ZOOM_MAX);
     xSemaphoreTake(g_stateLock, portMAX_DELAY);
+    // VISCA rate already seeds this; the web slider used to only set a
+    // target, so tickZoom bailed until a focus reply (or a PTZ rocker)
+    // had run. Same seed as setZoomRate so a slider move always transmits.
+    if (!g_s.haveZoomCmd) {
+        float seed = g_s.haveZoomReported ? (float) g_s.zoomReported : ZOOM_MIN;
+        g_s.zoomCmd = fmaxf(ZOOM_MIN, fminf(ZOOM_MAX, seed));
+        g_s.haveZoomCmd = true;
+        g_s.zoomVel = 0.0f;
+    }
+    // New target the other way: drop old velocity. Keeping cruise speed meant
+    // we kept driving into 1 / 4095 and only later reversed, so jumps and
+    // interrupts looked like "it didn't take the new target".
+    zoom::applyRetarget(g_s.zoomCmd, g_s.zoomVel, pos);
     g_s.zoomTarget = pos;
     g_s.haveZoomTarget = true;
     g_s.zoomRateActive = false;
+    g_s.zoomPtzBoost = false;
+    g_s.haveZoomSent = false;
     xSemaphoreGive(g_stateLock);
+}
+
+// Absolute mapped goes must land on the table position. Padding a short
+// move out to the trigger distance overshoots, then a second Go (or a
+// VISCA repeat) pads the other way — the ring hunts between two stops.
+static void setZoomTargetMapped(int position) {
+    float v = 0.0f, a = 0.0f, c = -1.0f, d = -1.0f;
+    if (zoomLensGetRamp(&v, &a, &c, &d)) setLiveRamp(v, a, c, d);
+    setZoomTarget(position);
+}
+
+static float g_mmGoMm = -1.0f;
+static int g_mmGoPos = -1;
+
+static bool setZoomTargetMm(float mm) {
+    xSemaphoreTake(g_stateLock, portMAX_DELAY);
+    int cur = currentZoomPosLocked();
+    int lastDir = g_s.zoomLastDir;
+    float hint = g_s.zoomVmax;
+    xSemaphoreGive(g_stateLock);
+    if (g_mmGoMm > 0.0f && fabsf(mm - g_mmGoMm) < 0.2f && g_mmGoPos >= 1) {
+        setZoomTargetMapped(g_mmGoPos);
+        return true;
+    }
+    float useV = 0.0f, useA = 0.0f;
+    int guess = -1;
+    if (!zoomLensPosFromMmAt(mm, 0, hint, &guess, &useV, &useA)) return false;
+    int dir = guess > cur ? 1 : (guess < cur ? -1 : lastDir);
+    int pos = guess;
+    zoomLensPosFromMmAt(mm, dir, hint, &pos, &useV, &useA);
+    float useC = -1.0f, useD = -1.0f;
+    zoomLensGetRamp(nullptr, nullptr, &useC, &useD);
+    if (useV >= 50.0f) {
+        setLiveRamp(useV, useA >= 50.0f ? useA : useV * 2.0f, useC, useD);
+    }
+    g_mmGoMm = mm;
+    g_mmGoPos = pos;
+    setZoomTarget(pos);
+    return true;
+}
+
+static int holdZoomNow() {
+    int commanded = 0;
+    int wire = 1;
+    xSemaphoreTake(g_stateLock, portMAX_DELAY);
+    if (!g_s.haveZoomCmd) {
+        float seed = g_s.haveZoomReported ? (float) g_s.zoomReported : ZOOM_MIN;
+        g_s.zoomCmd = fmaxf(ZOOM_MIN, fminf(ZOOM_MAX, seed));
+        g_s.haveZoomCmd = true;
+    }
+    g_s.zoomVel = 0.0f;
+    g_s.zoomTarget = fmaxf(ZOOM_MIN, fminf(ZOOM_MAX, g_s.zoomCmd));
+    g_s.haveZoomTarget = true;
+    g_s.zoomRateActive = false;
+    g_s.zoomPtzBoost = false;
+    commanded = (int) lroundf(g_s.zoomCmd);
+    if (commanded < (int) ZOOM_MIN) commanded = (int) ZOOM_MIN;
+    if (commanded > (int) ZOOM_MAX) commanded = (int) ZOOM_MAX;
+    g_s.zoomReported = commanded;
+    g_s.haveZoomReported = true;
+    wire = commanded;
+    g_s.zoomSent = wire;
+    g_s.haveZoomSent = true;
+    xSemaphoreGive(g_stateLock);
+    canSendPacket(dji::buildFocusSet((uint16_t) wire));
+    return commanded;
+}
+
+static bool addLensSampleFrom(JsonVariantConst doc) {
+    xSemaphoreTake(g_stateLock, portMAX_DELAY);
+    int pos = currentZoomPosLocked();
+    int dir = g_s.zoomLastDir;
+    float vmax = g_s.zoomVmax;
+    float accel = g_s.zoomAccel;
+    xSemaphoreGive(g_stateLock);
+    if (!doc["pos"].isNull()) pos = doc["pos"] | pos;
+    else if (!doc["position"].isNull()) pos = doc["position"] | pos;
+    if (!doc["dir"].isNull()) dir = doc["dir"] | dir;
+    if (!doc["vmax"].isNull()) vmax = doc["vmax"] | vmax;
+    if (!doc["accel"].isNull()) accel = doc["accel"] | accel;
+    int band = doc["band"] | 0;
+    float mm = doc["mm"] | 0.0f;
+    if (!zoomLensAddSample((uint16_t) constrain(pos, (int) ZOOM_MIN, (int) ZOOM_MAX), mm, dir,
+                           vmax, accel, band)) {
+        return false;
+    }
+    zoomLensSave();
+    return true;
 }
 
 static void setZoomRate(float rate) {
     rate = fmaxf(-1.0f, fminf(1.0f, rate));
     xSemaphoreTake(g_stateLock, portMAX_DELAY);
     if (!g_s.haveZoomCmd) {
-        g_s.zoomCmd = 0.0f;
+        float seed = g_s.haveZoomReported ? (float) g_s.zoomReported : ZOOM_MIN;
+        g_s.zoomCmd = fmaxf(ZOOM_MIN, fminf(ZOOM_MAX, seed));
         g_s.haveZoomCmd = true;
     }
     if (fabsf(rate) < 0.02f) {
-        g_s.zoomRateActive = false;
-        g_s.zoomTarget = g_s.zoomCmd;
-        g_s.haveZoomTarget = true;
-        g_s.zoomVel = 0.0f;
+        // Idle PTZ stop frames (Pelco especially) must not cancel a slider /
+        // preset ramp. Only the rocker that was actually moving should coast.
+        if (g_s.zoomRateActive) {
+            float decel = fmaxf(1.0f, (g_s.zoomDecel >= 50.0f ? g_s.zoomDecel : g_s.zoomAccel)) *
+                          ZOOM_PTZ_ACCEL_MUL;
+            float vel = g_s.zoomVel;
+            float vcut = g_s.zoomVcut;
+            float v = fabsf(vel);
+            float stopDist;
+            if (vcut >= 8.0f && v > vcut) {
+                stopDist = (v * v - vcut * vcut) / (2.0f * decel);
+            } else if (vcut >= 8.0f) {
+                stopDist = 0.0f;
+            } else {
+                stopDist = (vel * vel) / (2.0f * decel);
+            }
+            float coast = g_s.zoomCmd + copysignf(stopDist, vel);
+            g_s.zoomTarget = fmaxf(ZOOM_MIN, fminf(ZOOM_MAX, coast));
+            g_s.haveZoomTarget = true;
+            g_s.zoomRateActive = false;
+            g_s.zoomPtzBoost = true;
+            // Keep zoomVel; tickZoom decelerates onto that coast target.
+        }
     } else {
         g_s.zoomRateActive = true;
+        g_s.zoomPtzBoost = true;
         g_s.zoomRateSigned = rate;
         g_s.zoomTarget = rate > 0.0f ? ZOOM_MAX : ZOOM_MIN;
         g_s.haveZoomTarget = true;
@@ -443,10 +582,9 @@ static void setZoomRate(float rate) {
 }
 
 static void setZoomProfile(float vmax, float accel) {
-    xSemaphoreTake(g_stateLock, portMAX_DELAY);
-    g_s.zoomVmax = fmaxf(50.0f, fminf(8000.0f, vmax));
-    g_s.zoomAccel = fmaxf(50.0f, fminf(40000.0f, accel));
-    xSemaphoreGive(g_stateLock);
+    // Live ramp only. Canonical curve speeds are stored by the lens wizard
+    // so dragging Max speed during a session cannot rewrite a calibrated curve.
+    setLiveRamp(vmax, accel);
 }
 
 // Mirrors GimbalCanSession._exec's motor-calib branch: clear the ramp state so the
@@ -459,6 +597,7 @@ static void motorCalibrate() {
     g_s.haveZoomSent = false;
     g_s.haveZoomReported = false;
     g_s.zoomRateActive = false;
+    g_s.zoomPtzBoost = false;
     xSemaphoreGive(g_stateLock);
     canSendPacket(dji::buildMotorCalibrate());
     canSendPacket(dji::buildFocusGet());
@@ -525,12 +664,33 @@ static void fillStateJson(JsonObject doc) {
     else doc["zoom_target"] = nullptr;
     doc["zoom_vmax"] = g_s.zoomVmax;
     doc["zoom_accel"] = g_s.zoomAccel;
+    doc["zoom_decel"] = g_s.zoomDecel;
+    doc["zoom_vcut"] = g_s.zoomVcut;
+    bool zoomMoving = g_s.haveZoomTarget && g_s.haveZoomCmd &&
+                      (fabsf(g_s.zoomTarget - g_s.zoomCmd) >= 0.5f || fabsf(g_s.zoomVel) >= 8.0f);
+    doc["zoom_moving"] = zoomMoving;
+    int zoomPos = currentZoomPosLocked();
+    int zoomDir = g_s.zoomLastDir;
+    doc["zoom_last_dir"] = zoomDir;
     if (g_s.lastRxMs != 0) doc["last_rx_age_s"] = (now - g_s.lastRxMs) / 1000.0f;
     else doc["last_rx_age_s"] = nullptr;
     doc["last_error"] = g_s.lastError[0] ? g_s.lastError : nullptr;
     doc["tx_ok"] = g_can.txOk;
     doc["rx_ok"] = g_s.rxOk;
     xSemaphoreGive(g_stateLock);
+
+    float zoomMm = 0.0f;
+    if (zoomLensMmFromPos(zoomPos, zoomDir, &zoomMm)) doc["zoom_mm"] = zoomMm;
+    else doc["zoom_mm"] = nullptr;
+    doc["lens_enabled"] = zoomLensWantEnabled();
+    doc["lens_ready"] = zoomLensEnabled();
+    doc["lens_points"] = zoomLensSampleCount();
+    doc["lens_coupling"] = zoomLensCouplingReady();
+    int ein = 0, eout = 0;
+    if (zoomLensGetEngage(-1, &ein)) doc["lens_engage_in"] = ein;
+    else doc["lens_engage_in"] = 0;
+    if (zoomLensGetEngage(1, &eout)) doc["lens_engage_out"] = eout;
+    else doc["lens_engage_out"] = 0;
 
     // ESP32-specific extras.
     doc["rssi"] = WiFi.RSSI();
@@ -642,7 +802,9 @@ static void applyAngles(const dji::GimbalAngles &a, bool isPush) {
 
 // Mirrors GimbalCanSession._apply_zoom: the first focus reply seeds the ramp state.
 static void applyZoom(uint32_t zoom) {
-    uint32_t z = min(zoom, (uint32_t) ZOOM_MAX);
+    uint32_t z = zoom;
+    if (z < (uint32_t) ZOOM_MIN) z = (uint32_t) ZOOM_MIN;
+    if (z > (uint32_t) ZOOM_MAX) z = (uint32_t) ZOOM_MAX;
     xSemaphoreTake(g_stateLock, portMAX_DELAY);
     if (!g_s.haveZoomCmd) {
         g_s.zoomCmd = (float) z;
@@ -776,6 +938,10 @@ static void handlePositionCommand(float yaw, float roll, float pitch, float time
     canSendPacket(dji::buildControlPosition(yaw, roll, pitch, true, timeS));
 }
 
+static bool jsonIsNumber(JsonVariantConst v) {
+    return v.is<JsonInteger>() || v.is<JsonFloat>();
+}
+
 static bool handleJsonCommand(JsonDocument &doc) {
     const char *cmd = doc["cmd"] | "";
     if (strcmp(cmd, "speed") == 0) {
@@ -785,9 +951,27 @@ static bool handleJsonCommand(JsonDocument &doc) {
         handlePositionCommand(doc["yaw"] | 0.0f, doc["roll"] | 0.0f, doc["pitch"] | 0.0f,
                               doc["time_s"] | 0.4f);
     } else if (strcmp(cmd, "zoom") == 0) {
-        setZoomTarget(doc["position"] | 0);
+        // JsonInteger so position 0 is not dropped (isNull / "| 0" pitfalls).
+        if (jsonIsNumber(doc["position"])) {
+            setZoomTarget((int) lroundf(doc["position"].as<float>()));
+        } else if (jsonIsNumber(doc["mm"])) {
+            setZoomTargetMm(doc["mm"].as<float>());
+        }
+    } else if (strcmp(cmd, "zoom_hold") == 0) {
+        holdZoomNow();
     } else if (strcmp(cmd, "zoom_profile") == 0) {
-        setZoomProfile(doc["vmax"] | ZOOM_VMAX_DEFAULT, doc["accel"] | ZOOM_ACCEL_DEFAULT);
+        float vmax = doc["vmax"] | ZOOM_VMAX_DEFAULT;
+        float accel = doc["accel"] | ZOOM_ACCEL_DEFAULT;
+        float vcut = doc["vcut"] | -1.0f;
+        if (doc["vcut"].isNull()) vcut = -1.0f;
+        float decel = doc["decel"] | -1.0f;
+        if (doc["decel"].isNull()) decel = -1.0f;
+        setLiveRamp(vmax, accel, vcut, decel);
+    } else if (strcmp(cmd, "lens_sample") == 0) {
+        addLensSampleFrom(doc.as<JsonVariantConst>());
+    } else if (strcmp(cmd, "lens_clear") == 0) {
+        zoomLensClearSamples();
+        zoomLensSave();
     } else if (*cmd) {
         bool ok = execNamedCommand(cmd);
         if (!ok) Serial.printf("[ws] unknown cmd: %s\n", cmd);
@@ -890,22 +1074,116 @@ static void setupRestApi() {
         });
     server.addHandler(position);
 
-    auto *zoom = new AsyncCallbackJsonWebHandler("/api/zoom",
+    // ESPAsyncWebServer treats "/api/zoom" as a prefix ("/api/zoom/...").
+    // Register the more specific lens/profile routes first or they never run.
+    auto *lensSample = new AsyncCallbackJsonWebHandler("/api/zoom/lens/sample",
+        [](AsyncWebServerRequest *req, JsonVariant &json) {
+            if (!addLensSampleFrom(json.as<JsonVariantConst>())) {
+                req->send(400, "application/json", "{\"ok\":false}");
+                return;
+            }
+            JsonDocument outd;
+            zoomLensFillJson(outd.to<JsonObject>());
+            outd["ok"] = true;
+            String out;
+            serializeJson(outd, out);
+            req->send(200, "application/json", out);
+        });
+    lensSample->setMethod(HTTP_POST);
+    server.addHandler(lensSample);
+
+    auto *lensEnable = new AsyncCallbackJsonWebHandler("/api/zoom/lens/enable",
         [](AsyncWebServerRequest *req, JsonVariant &json) {
             JsonObject body = json.as<JsonObject>();
-            setZoomTarget(body["position"] | 0);
-            sendJsonOk(req, "zoom");
+            bool on = true;
+            if (body["enabled"].is<bool>()) on = body["enabled"].as<bool>();
+            zoomLensSetEnabled(on);
+            zoomLensSave();
+            sendJsonOk(req, "lens-enable");
         });
-    server.addHandler(zoom);
+    lensEnable->setMethod(HTTP_POST);
+    server.addHandler(lensEnable);
+
+    server.on("/api/zoom/lens/clear", HTTP_POST, [](AsyncWebServerRequest *req) {
+        zoomLensClearSamples();
+        zoomLensSave();
+        sendJsonOk(req, "lens-clear");
+    });
+
+    server.on("/api/zoom/lens", HTTP_GET, [](AsyncWebServerRequest *req) {
+        JsonDocument doc;
+        zoomLensFillJson(doc.to<JsonObject>());
+        String out;
+        serializeJson(doc, out);
+        req->send(200, "application/json", out);
+    });
+
+    auto *lensPut = new AsyncCallbackJsonWebHandler("/api/zoom/lens",
+        [](AsyncWebServerRequest *req, JsonVariant &json) {
+            if (!zoomLensApplyJson(json.as<JsonVariantConst>())) {
+                req->send(400, "application/json", "{\"ok\":false}");
+                return;
+            }
+            JsonObject body = json.as<JsonObject>();
+            xSemaphoreTake(g_stateLock, portMAX_DELAY);
+            float vmax = body["vmax"] | g_s.zoomVmax;
+            float accel = body["accel"] | g_s.zoomAccel;
+            float vcut = body["vcut"] | g_s.zoomVcut;
+            float decel = body["decel"] | g_s.zoomDecel;
+            xSemaphoreGive(g_stateLock);
+            if (!body["vmax"].isNull() || !body["accel"].isNull() ||
+                !body["vcut"].isNull() || !body["decel"].isNull()) {
+                setLiveRamp(vmax, accel, body["vcut"].isNull() ? -1.0f : vcut,
+                            body["decel"].isNull() ? -1.0f : decel);
+            }
+            if (body["coupling"] | false) {
+                zoomLensEnsureCurve(vmax, accel, true);
+            }
+            zoomLensSave();
+            JsonDocument outd;
+            zoomLensFillJson(outd.to<JsonObject>());
+            outd["ok"] = true;
+            String out;
+            serializeJson(outd, out);
+            req->send(200, "application/json", out);
+        });
+    lensPut->setMethod(HTTP_PUT | HTTP_POST);
+    server.addHandler(lensPut);
+
+    server.on("/api/zoom/hold", HTTP_POST, [](AsyncWebServerRequest *req) {
+        int pos = holdZoomNow();
+        JsonDocument doc;
+        doc["ok"] = "zoom-hold";
+        doc["position"] = pos;
+        String out;
+        serializeJson(doc, out);
+        req->send(200, "application/json", out);
+    });
 
     auto *zoomProfile = new AsyncCallbackJsonWebHandler("/api/zoom/profile",
         [](AsyncWebServerRequest *req, JsonVariant &json) {
             JsonObject body = json.as<JsonObject>();
-            setZoomProfile(body["vmax"] | ZOOM_VMAX_DEFAULT,
-                           body["accel"] | ZOOM_ACCEL_DEFAULT);
+            setLiveRamp(body["vmax"] | ZOOM_VMAX_DEFAULT,
+                        body["accel"] | ZOOM_ACCEL_DEFAULT,
+                        body["vcut"].isNull() ? -1.0f : (body["vcut"] | ZOOM_VCUT_DEFAULT),
+                        body["decel"].isNull() ? -1.0f : (body["decel"] | -1.0f));
             sendJsonOk(req, "zoom-profile");
         });
+    zoomProfile->setMethod(HTTP_POST);
     server.addHandler(zoomProfile);
+
+    auto *zoom = new AsyncCallbackJsonWebHandler("/api/zoom",
+        [](AsyncWebServerRequest *req, JsonVariant &json) {
+            JsonObject body = json.as<JsonObject>();
+            if (jsonIsNumber(body["position"])) {
+                setZoomTarget((int) lroundf(body["position"].as<float>()));
+            } else if (jsonIsNumber(body["mm"])) {
+                setZoomTargetMm(body["mm"].as<float>());
+            }
+            sendJsonOk(req, "zoom");
+        });
+    zoom->setMethod(HTTP_POST);
+    server.addHandler(zoom);
 
     // ESPAsyncWebServer has no path parameters, so /api/command/<name> is one
     // registration per allowed name (the same allow-list as dji_gimbal_web.py).
@@ -996,6 +1274,11 @@ void setup() {
     if (!LittleFS.begin(true)) {
         Serial.println("[fs] LittleFS mount failed");
     }
+    zoomLensBegin();
+    {
+        float lv, la, lc = -1.0f, ld = -1.0f;
+        if (zoomLensGetRamp(&lv, &la, &lc, &ld)) setLiveRamp(lv, la, lc, ld);
+    }
 
     setupWifi();
     setupCan();
@@ -1009,7 +1292,10 @@ void setup() {
     ptz.position = [](float y, float r, float p, float t) {
         handlePositionCommand(y, r, p, t);
     };
-    ptz.zoomAbs = [](int pos) { setZoomTarget(pos); };
+    ptz.zoomAbs = [](int pos) {
+        if (zoomLensEnabled() || zoomLensCouplingReady()) setZoomTargetMapped(pos);
+        else setZoomTarget(pos);
+    };
     ptz.zoomRate = [](float rate) { setZoomRate(rate); };
     ptz.home = []() { execNamedCommand("recenter"); };
     ptz.sleep = []() { execNamedCommand("sleep"); };
@@ -1033,6 +1319,30 @@ void setup() {
         if (ok) *z = g_s.zoomReported;
         xSemaphoreGive(g_stateLock);
         return ok;
+    };
+    ptz.zoomFromOptical = [](float t, int *pos) -> bool {
+        if (!pos || !zoomLensEnabled()) return false;
+        float mm;
+        if (!zoomLensMmAtOptical(t, &mm)) return false;
+        xSemaphoreTake(g_stateLock, portMAX_DELAY);
+        int cur = currentZoomPosLocked();
+        int lastDir = g_s.zoomLastDir;
+        xSemaphoreGive(g_stateLock);
+        int guess = 0;
+        if (!zoomLensPosFromMm(mm, 0, &guess)) return false;
+        int dir = guess > cur ? 1 : (guess < cur ? -1 : lastDir);
+        return zoomLensPosFromMm(mm, dir, pos);
+    };
+    ptz.zoomToOptical = [](int z, float *t) -> bool {
+        if (!t || !zoomLensEnabled()) return false;
+        float wide, tele, mm;
+        if (!zoomLensGetRange(&wide, &tele)) return false;
+        if (!zoomLensMmFromPos(z, 0, &mm)) return false;
+        float span = tele - wide;
+        if (span < 1e-3f) return false;
+        float u = (mm - wide) / span;
+        *t = fmaxf(0.0f, fminf(1.0f, u));
+        return true;
     };
     ptzBridgeBegin(ptz);
 
