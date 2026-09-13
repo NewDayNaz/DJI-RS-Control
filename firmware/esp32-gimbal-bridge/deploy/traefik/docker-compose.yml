@@ -1,0 +1,47 @@
+# Standalone Traefik in front of the XIAO gimbal UI.
+# Point DNS (gimbal.example.com) at THIS machine, then:
+#   cd deploy/traefik
+#   copy .env.example .env   # set ACME_EMAIL + GIMBAL_HOST
+#   docker compose up -d
+#
+# Open https://gimbal.example.com on the iPhone (not http://172.20.10.150).
+# Let's Encrypt is trusted, so Safari will allow the camera.
+#
+# The ESP32 must be reachable from this host at ESP32_URL (same LAN / hotspot).
+# Docker on Linux sometimes swallows 172.20.0.0/16; if the board is on an
+# iPhone hotspot (172.20.10.x) and Traefik cannot connect, set
+#   network_mode: host
+# on the traefik service (Linux only) or pick a non-overlapping compose network.
+
+services:
+  traefik:
+    image: traefik:v3.4
+    restart: unless-stopped
+    command:
+      - --api.dashboard=false
+      - --log.level=INFO
+      - --providers.file.directory=/dynamic
+      - --providers.file.watch=true
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.websecure.http.tls=true
+      - --entrypoints.websecure.transport.respondingTimeouts.readTimeout=0
+      - --entrypoints.websecure.transport.respondingTimeouts.idleTimeout=0
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+      # If this host is not reachable on :80 from the internet, comment the
+      # httpchallenge lines and use a DNS challenge instead, e.g.:
+      # - --certificatesresolvers.le.acme.dnschallenge=true
+      # - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./dynamic:/dynamic:ro
+      - traefik-letsencrypt:/letsencrypt
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  traefik-letsencrypt:

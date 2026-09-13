@@ -1,0 +1,50 @@
+# Traefik v3 file provider — HTTPS in front of the ESP32 gimbal UI.
+# The board speaks HTTP + WebSocket on port 80. The browser already uses
+# wss:// when the page is HTTPS (see index.html connect()).
+#
+# If you already run Traefik, drop this file in your dynamic directory and
+# edit Host() + the backend URL. Otherwise use the sibling docker-compose.yml.
+
+http:
+  routers:
+    gimbal:
+      rule: Host(`gimbal.example.com`)
+      entryPoints:
+        - websecure
+      service: gimbal
+      tls:
+        certResolver: le
+      # Keep /ws, /api, and LittleFS paths unchanged.
+      priority: 10
+
+    # Optional: same host on :80 so ACME httpChallenge works, then bounce to HTTPS.
+    gimbal-http:
+      rule: Host(`gimbal.example.com`)
+      entryPoints:
+        - web
+      service: gimbal
+      middlewares:
+        - gimbal-https
+      priority: 10
+
+  middlewares:
+    gimbal-https:
+      redirectScheme:
+        scheme: https
+        permanent: true
+
+  services:
+    gimbal:
+      loadBalancer:
+        passHostHeader: true
+        serversTransport: gimbal
+        servers:
+          - url: http://172.20.10.150:80
+
+  serversTransports:
+    gimbal:
+      forwardingTimeouts:
+        dialTimeout: 8s
+        # 0 = wait forever. Needed so /ws is not killed mid-stream.
+        responseHeaderTimeout: 0s
+        idleConnTimeout: 3600s
