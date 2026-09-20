@@ -56,6 +56,38 @@ D6/D7 are also UART0. This firmware uses USB CDC for serial so those pins stay o
 
 ## Flash and use
 
+### Automated Setup and Flash (Recommended)
+
+**First time setup:**
+
+Windows (PowerShell):
+```powershell
+cd firmware/esp32-gimbal-bridge
+.\setup-dev-environment.ps1
+```
+
+Linux/macOS:
+```bash
+cd firmware/esp32-gimbal-bridge
+./setup-dev-environment.sh
+```
+
+**Build and flash:**
+
+Windows (PowerShell):
+```powershell
+.\flash-board.ps1
+```
+
+Linux/macOS:
+```bash
+./flash-board.sh
+```
+
+The scripts automatically find your board, build, and flash both firmware and web UI. See [QUICK_START.md](QUICK_START.md) for detailed instructions.
+
+### Manual Flash
+
 From `firmware/esp32-gimbal-bridge`, in **PowerShell or cmd** (not Git Bash):
 
 ```text
