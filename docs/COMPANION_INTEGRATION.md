@@ -356,6 +356,74 @@ Set in `platformio.ini`:
 
 ---
 
+## Alternative: Using VISCA Module with Repeat-While-Held
+
+If you prefer using the native Sony VISCA Companion module instead of HTTP, you can work around the watchdog limitation using Companion's Duration Group feature.
+
+### How It Works
+
+The VISCA watchdog (2000ms) stops movement if no new command arrives. To keep the watchdog satisfied, configure Companion to **continuously re-send** the movement command while the button is held:
+
+#### Configuration Steps
+
+1. **Add Sony VISCA Connection:**
+   - Module: `Sony VISCA`
+   - Protocol: `TCP` (recommended) or `UDP`
+   - IP: `192.168.1.42`
+   - Port: `5678` (TCP) or `1259` (UDP raw) or `52381` (UDP with IP header)
+
+2. **Configure Pan Left Button:**
+
+   **Press Actions:**
+   - Action: Sony VISCA → `Pan Left` (speed: 0x14)
+
+   **Add Duration Group:**
+   - Click "Add duration group"
+   - Set delay: `100` ms
+   - Enable ✅ **Execute while held**
+   - Inside the group, add:
+     - Action: `internal: Button: Trigger Press` (this button)
+     - Option: ✅ **Force press if already pressed**
+
+   **Release Actions:**
+   - Action: Sony VISCA → `Pan/Tilt Stop`
+
+3. **Result:**
+   - Button press → Sends "Pan Left" 
+   - After 100ms (while still held) → Re-triggers the button → Sends "Pan Left" again
+   - This loops every 100ms while button is held (10 Hz)
+   - Button release → Sends "Pan/Tilt Stop"
+
+### Modern Approach (Companion 5.x)
+
+Alternatively, use the newer logic actions:
+
+1. **Press Actions:**
+   - `internal: Logic While`
+     - Condition: `internal:buttonPushed`
+     - Inside loop:
+       - Sony VISCA → `Pan Left`
+       - `internal: Wait` → `100` ms
+
+2. **Release Actions:**
+   - Sony VISCA → `Pan/Tilt Stop`
+
+### Pros & Cons of VISCA vs HTTP
+
+| Feature | VISCA Module | HTTP API |
+|---------|--------------|----------|
+| **Setup** | Native PTZ module | Generic HTTP module |
+| **Button Config** | Duration Group loop (workaround) | Single action per button |
+| **Reliability** | UDP (most VISCA) = packet loss | TCP = guaranteed delivery |
+| **Latency** | ~5-15ms | ~10-50ms |
+| **Features** | PTZ subset only | All gimbal commands |
+| **Watchdog** | 2000ms (requires 10 Hz loop) | 250ms deadman (no loop needed) |
+| **Debugging** | Binary protocol, hex dumps | JSON, test with curl |
+
+**Recommendation:** Use HTTP API unless you have a specific need for VISCA compatibility with existing hardware workflows.
+
+---
+
 ## Comparison: HTTP vs PTZ Protocols
 
 ### VISCA Example (Complex, Unreliable)
