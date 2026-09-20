@@ -95,11 +95,19 @@ Focus Wheel cable and the board dies with the 5 V rail.
 
 ## ⚠️ Control Interface Selection
 
-**Binary PTZ protocols (VISCA/Pelco) are disabled by default.** These protocols were designed in the 1990s for hardware joysticks over RS-485 serial. For modern software control (Bitfocus Companion, custom apps), use the **HTTP/WebSocket API** instead.
+Multiple control interfaces are available for different use cases:
 
-### Recommended: HTTP/WebSocket API
+### Enabled by Default
 
-**For Bitfocus Companion and software controllers:**
+- **VISCA** (UDP 52381, UDP 1259, TCP 5678) — Hardware PTZ controllers with 500ms watchdog
+- **HTTP API** at `/api/*` — REST endpoints for all commands
+- **WebSocket** at `/ws` — Bidirectional real-time control + telemetry  
+- **Panasonic AW** (UDP 49152) — ASCII protocol for AW-series controllers
+- **HTTP CGI** (port 80) — PTZOptics `ptzctrl`, Sony `ptzf`, Panasonic `aw_ptz`
+
+### Recommended for Software Control (Companion, custom apps)
+
+**HTTP/WebSocket API is preferred over binary PTZ protocols:**
 - ✅ **More reliable:** TCP vs UDP packet loss
 - ✅ **Simpler:** JSON vs binary protocols  
 - ✅ **Full-featured:** All gimbal commands, not just PTZ subset
@@ -108,38 +116,23 @@ Focus Wheel cable and the board dies with the 5 V rail.
 
 **See [`docs/COMPANION_INTEGRATION.md`](../../docs/COMPANION_INTEGRATION.md) for complete setup guide.**
 
-**Example Companion button:**
-```http
-POST http://gimbal-ip/api/speed
-{"yaw": 30, "pitch": 0, "roll": 0, "hold": true}
-```
+### Optional: Pelco-D/P Protocol
 
-### Enabled Protocols (Always Available)
-
-- **HTTP API** at `/api/*` — REST endpoints for all commands
-- **WebSocket** at `/ws` — Bidirectional real-time control + telemetry
-- **Panasonic AW** (UDP 49152) — ASCII protocol, self-correcting
-- **HTTP CGI** (port 80) — PTZOptics `ptzctrl`, Sony `ptzf`, Panasonic `aw_ptz`
-
-### Optional: Hardware PTZ Controllers
-
-**Only enable if you have physical PTZ hardware** (Sony RM-IP, PTZOptics SuperJoy, Pelco keyboards):
-
-**Pelco-D/P** (`ENABLE_PELCO=1`):
-- UDP+TCP 4000
-- Stateless snapshots (self-correcting)
-- Good for unreliable networks
-
-**VISCA** (`ENABLE_VISCA=1`):
-- UDP 52381 (over IP), UDP 1259/TCP 5678 (raw)
-- Stateful start/stop (packet loss → runaway movement)
-- Includes 500ms watchdog for safety
+**Disabled by default. Enable for Pelco hardware controllers:**
 
 **To enable in platformio.ini:**
 ```ini
 -DENABLE_PELCO=1
--DENABLE_VISCA=1
 ```
+
+**Pelco-D/P characteristics:**
+- UDP+TCP 4000
+- Stateless snapshots (self-correcting)
+- Good for unreliable networks
+
+### VISCA Watchdog
+
+VISCA includes a **500ms watchdog timeout** that auto-stops movement if no command is received. This prevents runaway movement from dropped UDP packets.
 
 ## First-time setup
 

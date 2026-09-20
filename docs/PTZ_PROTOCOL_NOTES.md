@@ -2,15 +2,15 @@
 
 ## Default Configuration (as of 2026-09-20)
 
-**Binary PTZ protocols are DISABLED by default:**
-- `ENABLE_VISCA=0` (disabled)
-- `ENABLE_PELCO=0` (disabled)
-
-**Always-enabled interfaces:**
+**Enabled by default:**
+- `ENABLE_VISCA=1` (enabled with 500ms watchdog)
 - HTTP REST API at `/api/*`
 - WebSocket at `/ws`
 - Panasonic AW (UDP 49152) - ASCII protocol, lightweight
 - HTTP CGI (port 80) - PTZOptics/Sony/Panasonic CGI endpoints
+
+**Disabled by default:**
+- `ENABLE_PELCO=0` (disabled)
 
 ## Rationale
 
