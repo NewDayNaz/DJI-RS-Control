@@ -3,12 +3,16 @@
 // Speaks the camera-side of the protocols those boxes already know, and maps
 // pan/tilt/zoom onto the DJI R SDK session in main.cpp:
 //
-//   VISCA over IP     UDP 52381   Sony 8-byte header + VISCA payload
-//   VISCA raw         UDP 1259    PTZOptics / generic (no IP header)
-//   VISCA raw         TCP 5678    PTZOptics / generic
-//   Pelco-D / Pelco-P UDP+TCP 4000
-//   Panasonic AW      UDP 49152   #PTS / #Z / #APC / #R / #O
-//   HTTP CGI          :80         PTZOptics ptzctrl, Sony ptzf, Panasonic aw_ptz
+//   VISCA over IP     UDP 52381   Sony 8-byte header + VISCA payload (enabled, with watchdog)
+//   VISCA raw         UDP 1259    PTZOptics / generic (no IP header, enabled, with watchdog)
+//   VISCA raw         TCP 5678    PTZOptics / generic (enabled, with watchdog)
+//   Pelco-D / Pelco-P UDP+TCP 4000 (stateless, self-correcting, ENABLE_PELCO to enable)
+//   Panasonic AW      UDP 49152   #PTS / #Z / #APC / #R / #O (always enabled)
+//   HTTP CGI          :80         PTZOptics ptzctrl, Sony ptzf, Panasonic aw_ptz (always enabled)
+//
+// VISCA enabled by default with 500ms watchdog timeout to prevent runaway movement from dropped packets.
+// For software control (Companion, web apps), HTTP/WebSocket API is recommended over binary PTZ protocols.
+// See docs/COMPANION_INTEGRATION.md for HTTP API integration guide.
 //
 // ONVIF is not implemented: SOAP + WS-Discovery is too heavy for the C3, and
 // dedicated PTZ hardware almost never speaks it (that's a VMS path).
