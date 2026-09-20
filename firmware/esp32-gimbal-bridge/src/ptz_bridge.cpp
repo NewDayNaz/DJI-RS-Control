@@ -10,9 +10,16 @@
 // ---------------------------------------------------------------------------
 // Ports (the ones hardware controllers actually have in their camera profiles)
 // ---------------------------------------------------------------------------
+#ifndef ENABLE_VISCA
+#define ENABLE_VISCA 0
+#endif
+
+#if ENABLE_VISCA
 static constexpr uint16_t kViscaIpUdp = 52381;
 static constexpr uint16_t kViscaRawUdp = 1259;
 static constexpr uint16_t kViscaRawTcp = 5678;
+static constexpr uint32_t kViscaTimeoutMs = 500; // Auto-stop if no command in 500ms
+#endif
 static constexpr uint16_t kPelcoPort = 4000;
 static constexpr uint16_t kPanasonicUdp = 49152;
 
@@ -232,8 +239,10 @@ static float viscaZoomRate(uint8_t p, int sign) {
 }
 
 // ---------------------------------------------------------------------------
-// VISCA
+// VISCA (compile-time optional: ENABLE_VISCA)
 // ---------------------------------------------------------------------------
+
+#if ENABLE_VISCA
 
 struct ViscaOut {
     uint8_t data[24];
@@ -352,6 +361,9 @@ static void handleVisca(const uint8_t *m, size_t n, ViscaOut &out) {
             if (tt == 0x01) pitch = viscaTiltDps(ww);
             else if (tt == 0x02) pitch = -viscaTiltDps(ww);
             driveSpeed(yaw, pitch);
+            bool moving = fabsf(yaw) > 0.05f || fabsf(pitch) > 0.05f;
+            g_viscaMoving = moving;
+            if (moving) g_viscaLastMoveMs = millis();
             noteCmd((pp == 0x03 && tt == 0x03) ? "visca stop" : "visca drive");
             return;
         }
@@ -575,6 +587,19 @@ static void onViscaDatagram(WiFiUDP &udp, bool framedIp, uint32_t *counter) {
         viscaReplyRaw(udp, ip, port, r);
     }
 }
+
+// VISCA watchdog: auto-stop if no movement command received within timeout.
+// Called from ptzTask loop. Prevents runaway movement from dropped UDP stop packets.
+static void checkViscaTimeout() {
+    if (g_viscaMoving && millis() - g_viscaLastMoveMs > kViscaTimeoutMs) {
+        g_viscaMoving = false;
+        if (g_sink.stop) g_sink.stop();
+        Serial.println("[visca] watchdog timeout - auto-stopped movement");
+        noteCmd("visca watchdog");
+    }
+}
+
+#endif // ENABLE_VISCA
 
 // ---------------------------------------------------------------------------
 // Pelco-D / Pelco-P
@@ -880,15 +905,22 @@ static void pumpPelcoTcp(TcpSlot &s) {
 
 static void ptzTask(void *) {
     for (;;) {
+#if ENABLE_VISCA
         onViscaDatagram(g_udpViscaIp, true, &g_nViscaUdp);
         onViscaDatagram(g_udpViscaRaw, false, &g_nViscaUdp);
+        checkViscaTimeout();
+#endif
         onPelcoUdp();
         onAwUdp();
 
+#if ENABLE_VISCA
         takeClient(g_tcpVisca, g_viscaCli, kTcpClients);
+#endif
         takeClient(g_tcpPelco, g_pelcoCli, kTcpClients);
         for (int i = 0; i < kTcpClients; i++) {
+#if ENABLE_VISCA
             pumpViscaTcp(g_viscaCli[i]);
+#endif
             pumpPelcoTcp(g_pelcoCli[i]);
         }
         vTaskDelay(pdMS_TO_TICKS(5));
@@ -1046,8 +1078,13 @@ void ptzBridgeFillStatus(JsonObject obj) {
     obj["invert_pan"] = g_invertPan;
     obj["invert_tilt"] = g_invertTilt;
     obj["invert_zoom"] = g_invertZoom;
+#if ENABLE_VISCA
     obj["visca_udp"] = g_nViscaUdp;
     obj["visca_tcp"] = g_nViscaTcp;
+    obj["visca_enabled"] = true;
+#else
+    obj["visca_enabled"] = false;
+#endif
     obj["pelco"] = g_nPelco;
     obj["panasonic"] = g_nAw;
     obj["cgi"] = g_nCgi;
@@ -1055,9 +1092,11 @@ void ptzBridgeFillStatus(JsonObject obj) {
     obj["last_from"] = g_lastFrom[0] ? g_lastFrom : nullptr;
     if (g_lastMs) obj["last_age_s"] = (millis() - g_lastMs) / 1000.0f;
     JsonObject ports = obj["ports"].to<JsonObject>();
+#if ENABLE_VISCA
     ports["visca_ip_udp"] = kViscaIpUdp;
     ports["visca_raw_udp"] = kViscaRawUdp;
     ports["visca_raw_tcp"] = kViscaRawTcp;
+#endif
     ports["pelco"] = kPelcoPort;
     ports["panasonic_udp"] = kPanasonicUdp;
 }
@@ -1077,16 +1116,23 @@ void ptzBridgeSetInvert(bool pan, bool tilt, bool zoom) {
 void ptzBridgeBegin(const PtzSink &sink) {
     g_sink = sink;
     bool ok = true;
+#if ENABLE_VISCA
     ok = g_udpViscaIp.begin(kViscaIpUdp) && ok;
     ok = g_udpViscaRaw.begin(kViscaRawUdp) && ok;
+    g_tcpVisca.begin();
+    g_tcpVisca.setNoDelay(true);
+#endif
     ok = g_udpPelco.begin(kPelcoPort) && ok;
     ok = g_udpAw.begin(kPanasonicUdp) && ok;
-    g_tcpVisca.begin();
     g_tcpPelco.begin();
-    g_tcpVisca.setNoDelay(true);
     g_tcpPelco.setNoDelay(true);
     xTaskCreate(ptzTask, "ptz", 6144, nullptr, 4, nullptr);
-    Serial.printf("[ptz] VISCA UDP %u/%u TCP %u  Pelco %u  AW UDP %u%s\n",
-                  kViscaIpUdp, kViscaRawUdp, kViscaRawTcp, kPelcoPort, kPanasonicUdp,
+#if ENABLE_VISCA
+    Serial.printf("[ptz] VISCA UDP %u/%u TCP %u (ENABLED with %ums watchdog)  Pelco %u  AW UDP %u%s\n",
+                  kViscaIpUdp, kViscaRawUdp, kViscaRawTcp, kViscaTimeoutMs, kPelcoPort, kPanasonicUdp,
                   ok ? "" : "  (a UDP bind failed)");
+#else
+    Serial.printf("[ptz] Pelco %u  AW UDP %u%s  (VISCA disabled at compile time)\n",
+                  kPelcoPort, kPanasonicUdp, ok ? "" : "  (a UDP bind failed)");
+#endif
 }

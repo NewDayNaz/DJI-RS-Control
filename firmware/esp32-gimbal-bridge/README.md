@@ -5,7 +5,7 @@ ESP32 firmware that speaks the DJI R SDK CAN protocol (documented in
 via [`dji_gimbal_cli.py`](../../dji_gimbal_cli.py) over a wired SH-C31G/Canable adapter) and
 exposes it as a phone/browser-friendly WebSocket + REST API with a built-in joystick web UI,
 and as the camera-side of the IP PTZ protocols hardware joystick/keyboard controllers already
-speak (VISCA, Pelco-D, Panasonic AW). The XIAO is powered from the DJI RS Focus Wheel's 4-pin
+speak (**Pelco-D/P** (recommended), Panasonic AW, HTTP CGI, and optionally VISCA). The XIAO is powered from the DJI RS Focus Wheel's 4-pin
 CAN port (`VCC_5V` + `GND`).
 
 This firmware tracks the **golden Python implementation** as its standard:
@@ -92,6 +92,30 @@ Focus Wheel cable and the board dies with the 5 V rail.
 > C3's native USB peripheral. `platformio.ini` already sets `-DARDUINO_USB_CDC_ON_BOOT=1`,
 > which is required for `Serial.print()`/`pio device monitor` to work over that port; without
 > it you'll see nothing on the console.
+
+## ⚠️ PTZ Protocol Selection
+
+**VISCA is disabled by default** (`ENABLE_VISCA=0` in platformio.ini) because it uses stateful start/stop commands. If a UDP stop packet is lost due to network issues or processing delays, the gimbal continues moving indefinitely. This is an inherent protocol design limitation.
+
+**Recommendation:** Use **Pelco-D/P** (UDP+TCP 4000) or **Panasonic AW** (UDP 49152) instead. These protocols send complete state snapshots in each frame and are self-correcting — a missed packet doesn't cause runaway movement.
+
+**Enabled protocols (always available):**
+- Pelco-D / Pelco-P (UDP+TCP 4000) — **RECOMMENDED**
+- Panasonic AW (UDP 49152)
+- HTTP CGI (PTZOptics `ptzctrl`, Sony `ptzf`, Panasonic `aw_ptz`)
+
+**Optional VISCA support:** Set `ENABLE_VISCA=1` in platformio.ini to enable:
+- VISCA over IP (UDP 52381), raw (UDP 1259 / TCP 5678)
+- Includes a 500ms watchdog timeout that auto-stops movement if no command arrives
+
+### Bitfocus Companion Users
+
+**Bitfocus Companion does NOT have native Pelco-D/P modules.** It primarily supports VISCA (sony-visca, PTZOptics modules). For Companion control, you have two options:
+
+1. **Enable VISCA** with `ENABLE_VISCA=1` — the watchdog provides safety against runaway movement
+2. **Use Pelco with workarounds:** Generic TCP/UDP Requests with raw hex commands, or Generic TCP-Serial bridge
+
+Most professional PTZ hardware controllers (Sony RM-IP, PTZOptics SuperJoy, Panasonic AW-RP, Pelco keyboards) support Pelco-D/P natively.
 
 ## First-time setup
 
