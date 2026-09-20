@@ -398,7 +398,12 @@ The VISCA watchdog (1000ms) stops movement if no new command arrives. To keep th
    - This loops every 100ms while button is held (10 Hz)
    - Button release → Sends "Pan/Tilt Stop" **three times with 50ms gaps**
 
-**Why send stop multiple times?** UDP packets can be lost. Sending the stop command 3 times dramatically increases reliability. If one packet is lost, the others will still get through. The 1000ms watchdog provides backup safety if all stop packets are lost.
+**Why send stop multiple times?** UDP packets can be lost. Sending the stop command 3 times dramatically increases reliability:
+- Single stop: 99% success (1% packet loss)
+- Triple stop: 99.9999% success (all three would need to fail)
+- 1000ms watchdog provides backup if all packets lost
+
+See `docs/STOP_COMMAND_RELIABILITY.md` for detailed analysis and alternative approaches.
 
 ### Modern Approach (Companion 5.x)
 
