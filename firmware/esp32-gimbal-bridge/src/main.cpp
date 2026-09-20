@@ -40,6 +40,7 @@
 #include "ptz_bridge.h"
 #include "zoom_lens.h"
 #include "zoom_ramp.h"
+#include "led_status.h"
 
 // GIMBAL_SLEEP_ENABLED gates the battery-power-management block below (presence sensing +
 // deep sleep) — see README.md "Power Management". The Seeed CAN hat uses D6–D10 (INT/CS/SPI)
@@ -73,6 +74,9 @@ static constexpr uint32_t ANGLE_POLL_MS = 50;       // ANGLE_POLL_S = 0.05
 static constexpr uint32_t PUSH_STALE_MS = 350;      // PUSH_STALE_S = 0.35
 static constexpr uint32_t STATE_BROADCAST_MS = 50;  // golden web streams snapshot at 20 Hz
 static constexpr uint32_t OFF_TIMEOUT_MS = 60000;   // deep-sleep after this long unplugged
+static constexpr uint32_t ZOOM_IDLE_RELEASE_MS = 1000;  // release control after 1s idle
+static constexpr uint32_t ZOOM_QUERY_INTERVAL_MS = 500; // query position every 500ms
+static constexpr int ZOOM_DRIFT_THRESHOLD = 30;     // counts drift to trigger resync
 
 // ---- Zoom ramp limits (src/zoom_ramp.h; golden session used 0–4096) ----
 // Documented motor-calib span is 0–4096, but the gimbal ignores those exact
@@ -120,6 +124,10 @@ struct SessionState {
     int zoomSent = 0;
     int zoomReported = 0;        // last commanded position (golden `_zoom`)
     bool haveZoomReported = false;
+    int zoomActual = 0;          // last position reported by gimbal (from focus replies)
+    bool haveZoomActual = false;
+    uint32_t lastZoomCommandMs = 0; // last time we changed zoom target
+    bool zoomActiveControl = false; // are we actively controlling the motor?
     float zoomVmax = ZOOM_VMAX_DEFAULT;
     float zoomAccel = ZOOM_ACCEL_DEFAULT;
     float zoomDecel = ZOOM_ACCEL_DEFAULT;
@@ -148,6 +156,7 @@ static uint32_t g_lastSpeedSendMs = 0;
 static uint32_t g_lastZoomMs = 0;
 static uint32_t g_lastAnglePollMs = 0;
 static uint32_t g_lastBroadcastMs = 0;
+static uint32_t g_lastZoomQueryMs = 0;
 
 static char g_version[24] = "";
 static bool g_haveVersion = false;
@@ -283,7 +292,8 @@ static bool zoomRampStep(float &pos, float &vel, float target, float vmax,
 }
 
 // Mirrors GimbalCanSession._tick_zoom: advance the ramp at ZOOM_HZ and transmit
-// focus-set only when the commanded integer position changes.
+// focus-set only when the commanded integer position changes. Includes idle release:
+// if we've arrived and been idle for ZOOM_IDLE_RELEASE_MS, release motor control.
 static void tickZoom(uint32_t now) {
     float dt = (now - g_lastZoomMs) / 1000.0f;
     g_lastZoomMs = now;
@@ -293,6 +303,22 @@ static void tickZoom(uint32_t now) {
         xSemaphoreGive(g_stateLock);
         return;
     }
+    
+    // Check for idle release: if we've arrived and haven't had a new command
+    // for ZOOM_IDLE_RELEASE_MS, release control so external adjustments work.
+    bool arrived = fabsf(g_s.zoomTarget - g_s.zoomCmd) < 0.5f && fabsf(g_s.zoomVel) < 8.0f;
+    if (arrived && g_s.zoomActiveControl && 
+        g_s.lastZoomCommandMs != 0 && now - g_s.lastZoomCommandMs > ZOOM_IDLE_RELEASE_MS) {
+        g_s.zoomActiveControl = false;
+        Serial.println("[zoom] idle release - external control allowed");
+    }
+    
+    // If we're not actively controlling, don't send commands
+    if (!g_s.zoomActiveControl) {
+        xSemaphoreGive(g_stateLock);
+        return;
+    }
+    
     float pos = g_s.zoomCmd;
     float vel = g_s.zoomVel;
     float target = g_s.zoomTarget;
@@ -308,7 +334,7 @@ static void tickZoom(uint32_t now) {
         vmax *= fmaxf(0.05f, fabsf(g_s.zoomRateSigned));
         target = g_s.zoomRateSigned > 0.0f ? ZOOM_MAX : ZOOM_MIN;
     }
-    bool arrived = zoomRampStep(pos, vel, target, vmax, accel, dt, vcut, decel);
+    arrived = zoomRampStep(pos, vel, target, vmax, accel, dt, vcut, decel);
     pos = fmaxf(ZOOM_MIN, fminf(ZOOM_MAX, pos));
     int commanded = (int) lroundf(pos);
     if (commanded < (int) ZOOM_MIN) commanded = (int) ZOOM_MIN;
@@ -370,6 +396,7 @@ static void tickSpeed(uint32_t now) {
         g_s.ctrlSource = CTRL_NONE;
         xSemaphoreGive(g_stateLock);
         Serial.println("[safety] speed watchdog: no update in time, zeroed gimbal speed");
+        ledStatusSafetyEvent();
         canSendPacket(dji::buildControlSpeed(0.0f, 0.0f, 0.0f));
         g_lastSpeedSendMs = now;
         return;
@@ -402,6 +429,14 @@ static void tickAnglePoll(uint32_t now) {
     canSendPacket(dji::buildObtainGimbalAngle(0x01));
 }
 
+// Periodically query focus position to detect external (manual) adjustments.
+// This enables drift detection even when we're not actively controlling.
+static void tickZoomQuery(uint32_t now) {
+    if (now - g_lastZoomQueryMs < ZOOM_QUERY_INTERVAL_MS) return;
+    g_lastZoomQueryMs = now;
+    canSendPacket(dji::buildFocusGet());
+}
+
 // ---------------------------------------------------------------------------
 // Zoom / command API (called from WS and REST handlers)
 // ---------------------------------------------------------------------------
@@ -429,12 +464,14 @@ static void setLiveRamp(float vmax, float accel, float vcut = -1.0f, float decel
 
 static void setZoomTarget(int position) {
     float pos = (float) constrain(position, (int) ZOOM_MIN, (int) ZOOM_MAX);
+    uint32_t now = millis();
     xSemaphoreTake(g_stateLock, portMAX_DELAY);
     // VISCA rate already seeds this; the web slider used to only set a
     // target, so tickZoom bailed until a focus reply (or a PTZ rocker)
     // had run. Same seed as setZoomRate so a slider move always transmits.
     if (!g_s.haveZoomCmd) {
-        float seed = g_s.haveZoomReported ? (float) g_s.zoomReported : ZOOM_MIN;
+        float seed = g_s.haveZoomActual ? (float) g_s.zoomActual : 
+                     (g_s.haveZoomReported ? (float) g_s.zoomReported : ZOOM_MIN);
         g_s.zoomCmd = fmaxf(ZOOM_MIN, fminf(ZOOM_MAX, seed));
         g_s.haveZoomCmd = true;
         g_s.zoomVel = 0.0f;
@@ -448,6 +485,8 @@ static void setZoomTarget(int position) {
     g_s.zoomRateActive = false;
     g_s.zoomPtzBoost = false;
     g_s.haveZoomSent = false;
+    g_s.lastZoomCommandMs = now;
+    g_s.zoomActiveControl = true; // Take control when user sets a target
     xSemaphoreGive(g_stateLock);
 }
 
@@ -541,9 +580,11 @@ static bool addLensSampleFrom(JsonVariantConst doc) {
 
 static void setZoomRate(float rate) {
     rate = fmaxf(-1.0f, fminf(1.0f, rate));
+    uint32_t now = millis();
     xSemaphoreTake(g_stateLock, portMAX_DELAY);
     if (!g_s.haveZoomCmd) {
-        float seed = g_s.haveZoomReported ? (float) g_s.zoomReported : ZOOM_MIN;
+        float seed = g_s.haveZoomActual ? (float) g_s.zoomActual :
+                     (g_s.haveZoomReported ? (float) g_s.zoomReported : ZOOM_MIN);
         g_s.zoomCmd = fmaxf(ZOOM_MIN, fminf(ZOOM_MAX, seed));
         g_s.haveZoomCmd = true;
     }
@@ -569,6 +610,7 @@ static void setZoomRate(float rate) {
             g_s.haveZoomTarget = true;
             g_s.zoomRateActive = false;
             g_s.zoomPtzBoost = true;
+            g_s.lastZoomCommandMs = now;
             // Keep zoomVel; tickZoom decelerates onto that coast target.
         }
     } else {
@@ -577,6 +619,8 @@ static void setZoomRate(float rate) {
         g_s.zoomRateSigned = rate;
         g_s.zoomTarget = rate > 0.0f ? ZOOM_MAX : ZOOM_MIN;
         g_s.haveZoomTarget = true;
+        g_s.lastZoomCommandMs = now;
+        g_s.zoomActiveControl = true; // Take control when rate commanded
     }
     xSemaphoreGive(g_stateLock);
 }
@@ -596,8 +640,11 @@ static void motorCalibrate() {
     g_s.haveZoomTarget = false;
     g_s.haveZoomSent = false;
     g_s.haveZoomReported = false;
+    g_s.haveZoomActual = false;
+    g_s.zoomActiveControl = false;
     g_s.zoomRateActive = false;
     g_s.zoomPtzBoost = false;
+    g_s.lastZoomCommandMs = 0;
     xSemaphoreGive(g_stateLock);
     canSendPacket(dji::buildMotorCalibrate());
     canSendPacket(dji::buildFocusGet());
@@ -660,8 +707,10 @@ static void fillStateJson(JsonObject doc) {
         doc["pitch"] = nullptr;
     }
     if (g_s.haveZoomReported) doc["zoom"] = g_s.zoomReported; else doc["zoom"] = nullptr;
+    if (g_s.haveZoomActual) doc["zoom_actual"] = g_s.zoomActual; else doc["zoom_actual"] = nullptr;
     if (g_s.haveZoomTarget) doc["zoom_target"] = (int) lroundf(g_s.zoomTarget);
     else doc["zoom_target"] = nullptr;
+    doc["zoom_active_control"] = g_s.zoomActiveControl;
     doc["zoom_vmax"] = g_s.zoomVmax;
     doc["zoom_accel"] = g_s.zoomAccel;
     doc["zoom_decel"] = g_s.zoomDecel;
@@ -800,12 +849,21 @@ static void applyAngles(const dji::GimbalAngles &a, bool isPush) {
     xSemaphoreGive(g_stateLock);
 }
 
-// Mirrors GimbalCanSession._apply_zoom: the first focus reply seeds the ramp state.
+// Process focus position replies from the gimbal. Seeds the ramp on first reply,
+// then tracks actual position. If we're not actively controlling and position drifts,
+// or if drift is detected while idle, resync our target to allow external control.
 static void applyZoom(uint32_t zoom) {
     uint32_t z = zoom;
     if (z < (uint32_t) ZOOM_MIN) z = (uint32_t) ZOOM_MIN;
     if (z > (uint32_t) ZOOM_MAX) z = (uint32_t) ZOOM_MAX;
+    
     xSemaphoreTake(g_stateLock, portMAX_DELAY);
+    
+    // Always update the actual position reported by gimbal
+    g_s.zoomActual = (int) z;
+    g_s.haveZoomActual = true;
+    
+    // First-time seeding: initialize ramp state from gimbal's current position
     if (!g_s.haveZoomCmd) {
         g_s.zoomCmd = (float) z;
         if (!g_s.haveZoomTarget) {
@@ -816,7 +874,24 @@ static void applyZoom(uint32_t zoom) {
         g_s.zoomReported = (int) z;
         g_s.haveZoomReported = true;
         g_s.haveZoomCmd = true;
+        g_s.zoomActiveControl = false; // Start passive until first command
+        Serial.printf("[zoom] seeded at position %d\n", (int) z);
     }
+    // Drift detection: if actual position differs significantly from commanded,
+    // and we're not actively controlling, resync to the actual position.
+    // This allows external control (manual Focus Wheel) to take over.
+    else if (!g_s.zoomActiveControl || fabsf(g_s.zoomVel) < 1.0f) {
+        int drift = abs((int) z - g_s.zoomReported);
+        if (drift > ZOOM_DRIFT_THRESHOLD) {
+            g_s.zoomCmd = (float) z;
+            g_s.zoomTarget = (float) z;
+            g_s.zoomVel = 0.0f;
+            g_s.zoomReported = (int) z;
+            g_s.zoomActiveControl = false; // Ensure we release control
+            Serial.printf("[zoom] drift detected (%d counts), resynced to %d\n", drift, (int) z);
+        }
+    }
+    
     g_s.lastRxMs = millis();
     xSemaphoreGive(g_stateLock);
 }
@@ -1220,10 +1295,54 @@ static void setupRestApi() {
 }
 
 // ---------------------------------------------------------------------------
+// LED diagnostic state machine
+// ---------------------------------------------------------------------------
+
+static void updateLedDiagnostics() {
+    // Priority system: higher priority issues override lower ones
+    
+    // Critical: CAN failed to initialize
+    if (!g_can.started) {
+        ledStatusCritical();
+        return;
+    }
+
+    // Check for bus-off or critical CAN errors
+    const char *canState = canHwStateName();
+    if (strcmp(canState, "bus_off") == 0 || strcmp(canState, "recovering") == 0) {
+        ledStatusError();
+        return;
+    }
+
+    // Check if we're receiving gimbal frames (0x222)
+    uint32_t now = millis();
+    xSemaphoreTake(g_stateLock, portMAX_DELAY);
+    uint32_t lastRx = g_s.lastRxMs;
+    uint32_t rxCount = g_s.rxOk;
+    xSemaphoreGive(g_stateLock);
+
+    // Warning: CAN initialized but no gimbal data yet
+    if (rxCount == 0 || (lastRx != 0 && now - lastRx > 5000)) {
+        ledStatusSet(LED_CAN_NO_DATA, PATTERN_BLINK_SLOW);
+        return;
+    }
+
+    // Warning: stale data (more than 2 seconds since last frame)
+    if (lastRx != 0 && now - lastRx > 2000) {
+        ledStatusWarning();
+        return;
+    }
+
+    // All good: healthy operation
+    ledStatusHealthy();
+}
+
+// ---------------------------------------------------------------------------
 // Setup / loop
 // ---------------------------------------------------------------------------
 
 static void setupWifi() {
+    ledStatusSet(LED_WIFI_CONNECTING, PATTERN_BLINK_FAST);
     WiFiManager wm;
     // Uncomment to force the config portal on every boot while bringing this up:
     // wm.resetSettings();
@@ -1244,6 +1363,7 @@ static void setupCan() {
     xTaskCreate(canRxTask, "can_rx", 4096, nullptr, 5, nullptr);
     if (!g_can.started) {
         strncpy(g_s.lastError, "CAN controller failed to start", sizeof(g_s.lastError) - 1);
+        ledStatusCritical();
         return;
     }
     g_sessionStarted = true;
@@ -1260,6 +1380,10 @@ static void sessionStart() {
 void setup() {
     Serial.begin(115200);
     delay(200);
+
+    // Initialize LED diagnostics early
+    ledStatusInit();
+    ledStatusSet(LED_STARTUP, PATTERN_BREATHE);
 
     g_stateLock = xSemaphoreCreateMutex();
 
@@ -1357,6 +1481,7 @@ void setup() {
     g_lastZoomMs = now;
     g_lastAnglePollMs = now;
     g_lastBroadcastMs = now;
+    g_lastZoomQueryMs = now;
 
     Serial.println("[main] ready");
 }
@@ -1373,7 +1498,12 @@ void loop() {
     tickSpeed(now);
     if (now - g_lastZoomMs >= ZOOM_INTERVAL_MS) tickZoom(now);
     tickAnglePoll(now);
+    tickZoomQuery(now);  // Periodic position query for drift detection
     broadcastState(now);
+
+    // Update LED status based on current system state
+    updateLedDiagnostics();
+    ledStatusUpdate();
 
 #if GIMBAL_SLEEP_ENABLED
     if (digitalRead(GIMBAL_PRESENT_PIN) == HIGH) {
