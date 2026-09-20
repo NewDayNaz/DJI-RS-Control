@@ -40,6 +40,7 @@
 #include "ptz_bridge.h"
 #include "zoom_lens.h"
 #include "zoom_ramp.h"
+#include "led_status.h"
 
 // GIMBAL_SLEEP_ENABLED gates the battery-power-management block below (presence sensing +
 // deep sleep) — see README.md "Power Management". The Seeed CAN hat uses D6–D10 (INT/CS/SPI)
@@ -370,6 +371,7 @@ static void tickSpeed(uint32_t now) {
         g_s.ctrlSource = CTRL_NONE;
         xSemaphoreGive(g_stateLock);
         Serial.println("[safety] speed watchdog: no update in time, zeroed gimbal speed");
+        ledStatusSafetyEvent();
         canSendPacket(dji::buildControlSpeed(0.0f, 0.0f, 0.0f));
         g_lastSpeedSendMs = now;
         return;
@@ -1220,10 +1222,54 @@ static void setupRestApi() {
 }
 
 // ---------------------------------------------------------------------------
+// LED diagnostic state machine
+// ---------------------------------------------------------------------------
+
+static void updateLedDiagnostics() {
+    // Priority system: higher priority issues override lower ones
+    
+    // Critical: CAN failed to initialize
+    if (!g_can.started) {
+        ledStatusCritical();
+        return;
+    }
+
+    // Check for bus-off or critical CAN errors
+    const char *canState = canHwStateName();
+    if (strcmp(canState, "bus_off") == 0 || strcmp(canState, "recovering") == 0) {
+        ledStatusError();
+        return;
+    }
+
+    // Check if we're receiving gimbal frames (0x222)
+    uint32_t now = millis();
+    xSemaphoreTake(g_stateLock, portMAX_DELAY);
+    uint32_t lastRx = g_s.lastRxMs;
+    uint32_t rxCount = g_s.rxOk;
+    xSemaphoreGive(g_stateLock);
+
+    // Warning: CAN initialized but no gimbal data yet
+    if (rxCount == 0 || (lastRx != 0 && now - lastRx > 5000)) {
+        ledStatusSet(LED_CAN_NO_DATA, PATTERN_BLINK_SLOW);
+        return;
+    }
+
+    // Warning: stale data (more than 2 seconds since last frame)
+    if (lastRx != 0 && now - lastRx > 2000) {
+        ledStatusWarning();
+        return;
+    }
+
+    // All good: healthy operation
+    ledStatusHealthy();
+}
+
+// ---------------------------------------------------------------------------
 // Setup / loop
 // ---------------------------------------------------------------------------
 
 static void setupWifi() {
+    ledStatusSet(LED_WIFI_CONNECTING, PATTERN_BLINK_FAST);
     WiFiManager wm;
     // Uncomment to force the config portal on every boot while bringing this up:
     // wm.resetSettings();
@@ -1244,6 +1290,7 @@ static void setupCan() {
     xTaskCreate(canRxTask, "can_rx", 4096, nullptr, 5, nullptr);
     if (!g_can.started) {
         strncpy(g_s.lastError, "CAN controller failed to start", sizeof(g_s.lastError) - 1);
+        ledStatusCritical();
         return;
     }
     g_sessionStarted = true;
@@ -1260,6 +1307,10 @@ static void sessionStart() {
 void setup() {
     Serial.begin(115200);
     delay(200);
+
+    // Initialize LED diagnostics early
+    ledStatusInit();
+    ledStatusSet(LED_STARTUP, PATTERN_BREATHE);
 
     g_stateLock = xSemaphoreCreateMutex();
 
@@ -1374,6 +1425,10 @@ void loop() {
     if (now - g_lastZoomMs >= ZOOM_INTERVAL_MS) tickZoom(now);
     tickAnglePoll(now);
     broadcastState(now);
+
+    // Update LED status based on current system state
+    updateLedDiagnostics();
+    ledStatusUpdate();
 
 #if GIMBAL_SLEEP_ENABLED
     if (digitalRead(GIMBAL_PRESENT_PIN) == HIGH) {
