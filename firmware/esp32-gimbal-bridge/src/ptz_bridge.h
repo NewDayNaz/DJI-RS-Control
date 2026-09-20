@@ -10,9 +10,10 @@
 //   Panasonic AW      UDP 49152   #PTS / #Z / #APC / #R / #O (always enabled)
 //   HTTP CGI          :80         PTZOptics ptzctrl, Sony ptzf, Panasonic aw_ptz (always enabled)
 //
-// VISCA enabled by default with 500ms watchdog timeout to prevent runaway movement from dropped packets.
+// VISCA enabled by default with 2000ms watchdog timeout to prevent runaway movement from dropped packets.
+// Watchdog requires controllers that send continuous commands (10+ Hz) while held.
 // For software control (Companion, web apps), HTTP/WebSocket API is recommended over binary PTZ protocols.
-// See docs/COMPANION_INTEGRATION.md for HTTP API integration guide.
+// See docs/COMPANION_INTEGRATION.md for HTTP API integration guide and docs/VISCA_WATCHDOG_NOTES.md for details.
 //
 // ONVIF is not implemented: SOAP + WS-Discovery is too heavy for the C3, and
 // dedicated PTZ hardware almost never speaks it (that's a VMS path).
