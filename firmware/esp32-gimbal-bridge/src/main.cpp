@@ -74,9 +74,9 @@ static constexpr uint32_t ANGLE_POLL_MS = 50;       // ANGLE_POLL_S = 0.05
 static constexpr uint32_t PUSH_STALE_MS = 350;      // PUSH_STALE_S = 0.35
 static constexpr uint32_t STATE_BROADCAST_MS = 50;  // golden web streams snapshot at 20 Hz
 static constexpr uint32_t OFF_TIMEOUT_MS = 60000;   // deep-sleep after this long unplugged
-static constexpr uint32_t ZOOM_IDLE_RELEASE_MS = 3000;  // release control after 3s idle
-static constexpr uint32_t ZOOM_QUERY_INTERVAL_MS = 1500; // query position every 1.5s
-static constexpr int ZOOM_DRIFT_THRESHOLD = 50;     // counts drift to trigger resync
+static constexpr uint32_t ZOOM_IDLE_RELEASE_MS = 1000;  // release control after 1s idle
+static constexpr uint32_t ZOOM_QUERY_INTERVAL_MS = 500; // query position every 500ms
+static constexpr int ZOOM_DRIFT_THRESHOLD = 30;     // counts drift to trigger resync
 
 // ---- Zoom ramp limits (src/zoom_ramp.h; golden session used 0–4096) ----
 // Documented motor-calib span is 0–4096, but the gimbal ignores those exact

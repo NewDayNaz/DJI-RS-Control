@@ -83,15 +83,15 @@ This allows the firmware to distinguish between:
 Constants in `main.cpp`:
 
 ```cpp
-static constexpr uint32_t ZOOM_IDLE_RELEASE_MS = 3000;  // 3 seconds idle
-static constexpr uint32_t ZOOM_QUERY_INTERVAL_MS = 1500; // Query every 1.5s
-static constexpr int ZOOM_DRIFT_THRESHOLD = 50;         // 50 counts = resync
+static constexpr uint32_t ZOOM_IDLE_RELEASE_MS = 1000;  // 1 second idle
+static constexpr uint32_t ZOOM_QUERY_INTERVAL_MS = 500; // Query every 500ms
+static constexpr int ZOOM_DRIFT_THRESHOLD = 30;         // 30 counts = resync
 ```
 
 Adjust these if needed:
-- Shorter idle timeout = faster handoff to manual control
-- More frequent queries = faster drift detection
-- Lower threshold = more sensitive to external changes
+- Shorter idle timeout = faster handoff to manual control (currently 1s)
+- More frequent queries = faster drift detection (currently 500ms)
+- Lower threshold = more sensitive to external changes (currently 30 counts)
 
 ## API Changes
 
