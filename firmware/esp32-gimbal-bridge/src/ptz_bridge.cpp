@@ -21,7 +21,14 @@
 static constexpr uint16_t kViscaIpUdp = 52381;
 static constexpr uint16_t kViscaRawUdp = 1259;
 static constexpr uint16_t kViscaRawTcp = 5678;
-static constexpr uint32_t kViscaTimeoutMs = 500; // Auto-stop if no command in 500ms
+// VISCA watchdog: auto-stop if no command received within timeout.
+// NOTE: Only works with controllers that send continuous commands (10+ Hz) while held.
+// Controllers that send only on press/release will stop after timeout even if user is holding.
+// Set to 0 to disable watchdog (unsafe - allows runaway from dropped stop packets).
+#ifndef VISCA_WATCHDOG_MS
+#define VISCA_WATCHDOG_MS 2000
+#endif
+static constexpr uint32_t kViscaTimeoutMs = VISCA_WATCHDOG_MS;
 #endif
 #if ENABLE_PELCO
 static constexpr uint16_t kPelcoPort = 4000;
@@ -609,13 +616,16 @@ static void onViscaDatagram(WiFiUDP &udp, bool framedIp, uint32_t *counter) {
 
 // VISCA watchdog: auto-stop if no movement command received within timeout.
 // Called from ptzTask loop. Prevents runaway movement from dropped UDP stop packets.
+// WARNING: Only effective with controllers that send continuous commands while held!
 static void checkViscaTimeout() {
+#if VISCA_WATCHDOG_MS > 0
     if (g_viscaMoving && millis() - g_viscaLastMoveMs > kViscaTimeoutMs) {
         g_viscaMoving = false;
         if (g_sink.stop) g_sink.stop();
-        Serial.println("[visca] watchdog timeout - auto-stopped movement");
+        Serial.printf("[visca] watchdog timeout (%ums) - auto-stopped movement\n", kViscaTimeoutMs);
         noteCmd("visca watchdog");
     }
+#endif
 }
 
 #endif // ENABLE_VISCA

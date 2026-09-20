@@ -132,7 +132,21 @@ Multiple control interfaces are available for different use cases:
 
 ### VISCA Watchdog
 
-VISCA includes a **500ms watchdog timeout** that auto-stops movement if no command is received. This prevents runaway movement from dropped UDP packets.
+VISCA includes a **2000ms (2 second) watchdog timeout** that auto-stops movement if no command is received.
+
+**⚠️ Important Limitation:**
+The watchdog only works correctly with VISCA controllers that **send continuous commands** (10+ Hz) while the joystick is held. Controllers that send only on press/release will have movements stop after 2 seconds.
+
+**Compatible controllers:** Sony RM-IP series, PTZOptics hardware controllers  
+**May not work:** Some software VISCA implementations, cheap generic controllers
+
+**To adjust or disable the watchdog:**
+```ini
+; platformio.ini
+-DVISCA_WATCHDOG_MS=2000   ; 2 seconds (default)
+-DVISCA_WATCHDOG_MS=5000   ; 5 seconds (more lenient)
+-DVISCA_WATCHDOG_MS=0      ; Disabled (unsafe - allows runaway)
+```
 
 ## First-time setup
 
