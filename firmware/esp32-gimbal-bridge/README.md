@@ -99,7 +99,7 @@ Multiple control interfaces are available for different use cases:
 
 ### Enabled by Default
 
-- **VISCA** (UDP 52381, UDP 1259, TCP 5678) — Hardware PTZ controllers with 500ms watchdog
+- **VISCA** (UDP 52381, UDP 1259, TCP 5678) — Hardware PTZ controllers with 1s watchdog
 - **HTTP API** at `/api/*` — REST endpoints for all commands
 - **WebSocket** at `/ws` — Bidirectional real-time control + telemetry  
 - **Panasonic AW** (UDP 49152) — ASCII protocol for AW-series controllers
@@ -132,10 +132,10 @@ Multiple control interfaces are available for different use cases:
 
 ### VISCA Watchdog
 
-VISCA includes a **2000ms (2 second) watchdog timeout** that auto-stops movement if no command is received.
+VISCA includes a **1000ms (1 second) watchdog timeout** that auto-stops movement if no command is received.
 
 **⚠️ Important Limitation:**
-The watchdog only works correctly with VISCA controllers that **send continuous commands** (10+ Hz) while the joystick is held. Controllers that send only on press/release will have movements stop after 2 seconds.
+The watchdog only works correctly with VISCA controllers that **send continuous commands** (10+ Hz) while the joystick is held. Controllers that send only on press/release will have movements stop after 1 second.
 
 **Compatible controllers:** Sony RM-IP series, PTZOptics hardware controllers  
 **May not work:** Some software VISCA implementations, cheap generic controllers
@@ -143,8 +143,8 @@ The watchdog only works correctly with VISCA controllers that **send continuous 
 **To adjust or disable the watchdog:**
 ```ini
 ; platformio.ini
--DVISCA_WATCHDOG_MS=2000   ; 2 seconds (default)
--DVISCA_WATCHDOG_MS=5000   ; 5 seconds (more lenient)
+-DVISCA_WATCHDOG_MS=1000   ; 1 second (default)
+-DVISCA_WATCHDOG_MS=2000   ; 2 seconds (more lenient)
 -DVISCA_WATCHDOG_MS=0      ; Disabled (unsafe - allows runaway)
 ```
 

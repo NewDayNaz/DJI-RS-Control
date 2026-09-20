@@ -3,14 +3,14 @@
 // Speaks the camera-side of the protocols those boxes already know, and maps
 // pan/tilt/zoom onto the DJI R SDK session in main.cpp:
 //
-//   VISCA over IP     UDP 52381   Sony 8-byte header + VISCA payload (enabled, with watchdog)
-//   VISCA raw         UDP 1259    PTZOptics / generic (no IP header, enabled, with watchdog)
-//   VISCA raw         TCP 5678    PTZOptics / generic (enabled, with watchdog)
+//   VISCA over IP     UDP 52381   Sony 8-byte header + VISCA payload (enabled, 1s watchdog)
+//   VISCA raw         UDP 1259    PTZOptics / generic (no IP header, enabled, 1s watchdog)
+//   VISCA raw         TCP 5678    PTZOptics / generic (enabled, 1s watchdog)
 //   Pelco-D / Pelco-P UDP+TCP 4000 (stateless, self-correcting, ENABLE_PELCO to enable)
 //   Panasonic AW      UDP 49152   #PTS / #Z / #APC / #R / #O (always enabled)
 //   HTTP CGI          :80         PTZOptics ptzctrl, Sony ptzf, Panasonic aw_ptz (always enabled)
 //
-// VISCA enabled by default with 2000ms watchdog timeout to prevent runaway movement from dropped packets.
+// VISCA enabled by default with 1000ms watchdog timeout to prevent runaway movement from dropped packets.
 // Watchdog requires controllers that send continuous commands (10+ Hz) while held.
 // For software control (Companion, web apps), HTTP/WebSocket API is recommended over binary PTZ protocols.
 // See docs/COMPANION_INTEGRATION.md for HTTP API integration guide and docs/VISCA_WATCHDOG_NOTES.md for details.

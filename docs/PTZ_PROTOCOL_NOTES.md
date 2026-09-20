@@ -3,7 +3,7 @@
 ## Default Configuration (as of 2026-09-20)
 
 **Enabled by default:**
-- `ENABLE_VISCA=1` (enabled with 500ms watchdog)
+- `ENABLE_VISCA=1` (enabled with 1000ms watchdog)
 - HTTP REST API at `/api/*`
 - WebSocket at `/ws`
 - Panasonic AW (UDP 49152) - ASCII protocol, lightweight
@@ -42,7 +42,7 @@
 - PTZOptics controllers (some models)
 - Some broadcast switchers with PTZ control
 
-**Note:** Includes 500ms watchdog to prevent runaway movement from dropped UDP packets.
+**Note:** Includes 1000ms watchdog to prevent runaway movement from dropped UDP packets.
 
 ### Enable Pelco-D/P (`ENABLE_PELCO=1`)
 **Use case:** Physical hardware PTZ controllers that prefer Pelco
@@ -79,7 +79,7 @@
 
 ### VISCA Enabled
 ```
-[ptz] VISCA UDP 52381/1259 TCP 5678 (with 500ms watchdog)  AW UDP 49152
+[ptz] VISCA UDP 52381/1259 TCP 5678 (with 1s watchdog)  AW UDP 49152
 ```
 
 ### Pelco Enabled
@@ -89,7 +89,7 @@
 
 ### Both Enabled
 ```
-[ptz] VISCA UDP 52381/1259 TCP 5678 (with 500ms watchdog)  Pelco 4000  AW UDP 49152
+[ptz] VISCA UDP 52381/1259 TCP 5678 (with 1s watchdog)  Pelco 4000  AW UDP 49152
 ```
 
 ## Status API

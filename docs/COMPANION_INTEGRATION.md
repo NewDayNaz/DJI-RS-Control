@@ -362,7 +362,7 @@ If you prefer using the native Sony VISCA Companion module instead of HTTP, you 
 
 ### How It Works
 
-The VISCA watchdog (2000ms) stops movement if no new command arrives. To keep the watchdog satisfied, configure Companion to **continuously re-send** the movement command while the button is held:
+The VISCA watchdog (1000ms) stops movement if no new command arrives. To keep the watchdog satisfied, configure Companion to **continuously re-send** the movement command while the button is held:
 
 #### Configuration Steps
 
@@ -387,12 +387,18 @@ The VISCA watchdog (2000ms) stops movement if no new command arrives. To keep th
 
    **Release Actions:**
    - Action: Sony VISCA → `Pan/Tilt Stop`
+   - Action: `internal: Wait` → `50` ms
+   - Action: Sony VISCA → `Pan/Tilt Stop`
+   - Action: `internal: Wait` → `50` ms
+   - Action: Sony VISCA → `Pan/Tilt Stop`
 
 3. **Result:**
    - Button press → Sends "Pan Left" 
    - After 100ms (while still held) → Re-triggers the button → Sends "Pan Left" again
    - This loops every 100ms while button is held (10 Hz)
-   - Button release → Sends "Pan/Tilt Stop"
+   - Button release → Sends "Pan/Tilt Stop" **three times with 50ms gaps**
+
+**Why send stop multiple times?** UDP packets can be lost. Sending the stop command 3 times dramatically increases reliability. If one packet is lost, the others will still get through. The 1000ms watchdog provides backup safety if all stop packets are lost.
 
 ### Modern Approach (Companion 5.x)
 
@@ -407,6 +413,12 @@ Alternatively, use the newer logic actions:
 
 2. **Release Actions:**
    - Sony VISCA → `Pan/Tilt Stop`
+   - `internal: Wait` → `50` ms
+   - Sony VISCA → `Pan/Tilt Stop`
+   - `internal: Wait` → `50` ms
+   - Sony VISCA → `Pan/Tilt Stop`
+
+**Note:** Sending stop commands multiple times ensures reliable stopping even with UDP packet loss.
 
 ### Pros & Cons of VISCA vs HTTP
 
@@ -417,7 +429,8 @@ Alternatively, use the newer logic actions:
 | **Reliability** | UDP (most VISCA) = packet loss | TCP = guaranteed delivery |
 | **Latency** | ~5-15ms | ~10-50ms |
 | **Features** | PTZ subset only | All gimbal commands |
-| **Watchdog** | 2000ms (requires 10 Hz loop) | 250ms deadman (no loop needed) |
+| **Watchdog** | 1000ms (requires 10 Hz loop) | 250ms deadman (no loop needed) |
+| **Stop Safety** | Send 3x to handle UDP loss | TCP guarantees delivery |
 | **Debugging** | Binary protocol, hex dumps | JSON, test with curl |
 
 **Recommendation:** Use HTTP API unless you have a specific need for VISCA compatibility with existing hardware workflows.

@@ -13,7 +13,7 @@ Release joystick: Controller → "Stop" → Gimbal stops
 
 ## The Watchdog Solution
 
-A watchdog timer auto-stops movement if no VISCA command is received within a timeout period (default: 2000ms).
+A watchdog timer auto-stops movement if no VISCA command is received within a timeout period (default: 1000ms).
 
 ## The Fundamental Limitation
 
@@ -26,24 +26,24 @@ t=100ms:  Hold up     → "Move up" → Watchdog reset
 t=200ms:  Hold up     → "Move up" → Watchdog reset
 t=300ms:  Hold up     → "Move up" → Watchdog reset
 ...
-t=2000ms: Release     → "Stop"    → Gimbal stops
+t=1000ms: Release     → "Stop"    → Gimbal stops
 ```
 ✅ **Watchdog never fires** - continuous commands keep resetting it.
 
 ### Scenario B: Single Command Controller (BROKEN)
 ```
 t=0ms:    Press up    → "Move up" → Watchdog reset
-t=1-2000ms: Hold up   → (nothing sent)
-t=2000ms: Watchdog fires! → Gimbal stops ❌
-t=2000ms: Release     → "Stop" → (Already stopped)
+t=1-1000ms: Hold up   → (nothing sent)
+t=1000ms: Watchdog fires! → Gimbal stops ❌
+t=1000ms: Release     → "Stop" → (Already stopped)
 ```
-❌ **Movement stops after 2 seconds** even though user is still holding joystick!
+❌ **Movement stops after 1 second** even though user is still holding joystick!
 
 ### Scenario C: Packet Loss (WATCHDOG INTENDED USE)
 ```
 t=0ms:    Press up    → "Move up" → Gimbal moves
 t=100ms:  Release     → "Stop" [PACKET LOST]
-t=2100ms: Watchdog fires → Gimbal stops ✅
+t=1100ms: Watchdog fires → Gimbal stops ✅
 ```
 ✅ **Prevents runaway** - gimbal stops after timeout instead of moving forever.
 
@@ -70,7 +70,7 @@ These may have movements stop prematurely.
 ### Default Settings (platformio.ini)
 ```ini
 -DENABLE_VISCA=1           # Enable VISCA protocol
--DVISCA_WATCHDOG_MS=2000   # 2 second timeout
+-DVISCA_WATCHDOG_MS=1000   # 1 second timeout (default)
 ```
 
 ### Adjusting the Timeout
@@ -80,14 +80,14 @@ These may have movements stop prematurely.
 -DVISCA_WATCHDOG_MS=500
 ```
 - **Pros:** Faster safety stop on packet loss
-- **Cons:** More likely to stop legitimate movements
+- **Cons:** More likely to stop legitimate movements with slow controllers
 
-**Longer timeout (5000ms):**
+**Longer timeout (2000ms):**
 ```ini
--DVISCA_WATCHDOG_MS=5000
+-DVISCA_WATCHDOG_MS=2000
 ```
-- **Pros:** Less likely to stop legitimate movements
-- **Cons:** Runaway movement lasts 5 seconds before auto-stop
+- **Pros:** More forgiving for slower controllers
+- **Cons:** Runaway movement lasts 2 seconds before auto-stop
 
 **Disable watchdog (unsafe):**
 ```ini
@@ -123,9 +123,9 @@ To check if your VISCA controller sends continuous commands:
 ## Recommendations
 
 ### For Hardware VISCA Controllers
-Keep watchdog **enabled** with default 2000ms:
+Keep watchdog **enabled** with default 1000ms:
 ```ini
--DVISCA_WATCHDOG_MS=2000
+-DVISCA_WATCHDOG_MS=1000
 ```
 
 ### For Software/Companion VISCA Control
@@ -185,15 +185,15 @@ There's no perfect solution:
 
 ## Conclusion
 
-**The 2000ms watchdog is a compromise:**
+**The 1000ms watchdog is a compromise:**
 - Protects against dangerous runaway movement
 - Works with most hardware VISCA controllers
 - May cause false stops with single-command controllers
 
 **If you experience premature stops:**
 1. Test if your controller sends continuous commands
-2. If not, increase timeout: `-DVISCA_WATCHDOG_MS=5000`
-3. Or switch to HTTP API for software control
+2. If not, increase timeout: `-DVISCA_WATCHDOG_MS=2000` or `3000`
+3. Or switch to HTTP API for software control (recommended for Companion)
 4. Or enable Pelco-D/P if your hardware supports it
 
 **If you never use VISCA controllers:**
