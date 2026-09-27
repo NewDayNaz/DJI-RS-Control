@@ -35,9 +35,16 @@ static constexpr uint16_t kPelcoPort = 4000;
 #endif
 static constexpr uint16_t kPanasonicUdp = 49152;
 
-static constexpr float kMaxRateDefault = 30.0f;
+// Default kept low: VISCA/Pelco/AW sit behind WiFi + CAN, so a hot linear map
+// overshoots before the stick (or stop) catches up. Raise via /api/ptz/profile.
+static constexpr float kMaxRateDefault = 15.0f;
 static constexpr float kMaxRateMin = 5.0f;
 static constexpr float kMaxRateMax = 120.0f;
+// Stick expo: 1 = linear, 2 = squared. Mid VISCA speeds become much gentler.
+#ifndef PTZ_SPEED_EXPO
+#define PTZ_SPEED_EXPO 1.8f
+#endif
+static constexpr float kSpeedExpo = PTZ_SPEED_EXPO;
 static constexpr int kZoomMax = 4096;
 static constexpr int kPresetCount = 16;
 static constexpr int kTcpClients = 2;
@@ -132,24 +139,39 @@ static void ptzZoomRate(float rate) {
     g_sink.zoomRate(g_invertZoom ? -rate : rate);
 }
 
+static float applySpeedExpo(float n) {
+    if (n <= 0.0f) return 0.0f;
+    if (n >= 1.0f) return 1.0f;
+    if (kSpeedExpo <= 1.01f) return n;
+    return powf(n, kSpeedExpo);
+}
+
+// Preserve sign: |n| in [0,1] → expo, then re-apply sign. Clamps |n| > 1.
+static float shapedRate(float n) {
+    float a = fabsf(n);
+    if (a > 1.0f) a = 1.0f;
+    float out = applySpeedExpo(a) * g_maxRate;
+    return n < 0.0f ? -out : out;
+}
+
 static float viscaPanDps(uint8_t vv) {
     if (vv == 0) return 0.0f;
     float n = (float) vv / 24.0f;
     if (n > 1.0f) n = 1.0f;
-    return n * g_maxRate;
+    return applySpeedExpo(n) * g_maxRate;
 }
 
 static float viscaTiltDps(uint8_t ww) {
     if (ww == 0) return 0.0f;
     float n = (float) ww / 20.0f;
     if (n > 1.0f) n = 1.0f;
-    return n * g_maxRate;
+    return applySpeedExpo(n) * g_maxRate;
 }
 
 static float pelcoDps(uint8_t data) {
     if (data == 0xFF) return g_maxRate;
     float n = (float) (data > 0x3F ? 0x3F : data) / 63.0f;
-    return n * g_maxRate;
+    return applySpeedExpo(n) * g_maxRate;
 }
 
 static float awNorm(int v) {
@@ -768,7 +790,7 @@ static const char *handleAw(char *cmd) {
         int pan = awDigits(cmd + 3, 2);
         int tilt = awDigits(cmd + 5, 2);
         if (pan >= 0 && tilt >= 0) {
-            driveSpeed(awNorm(pan) * g_maxRate, awNorm(tilt) * g_maxRate);
+            driveSpeed(shapedRate(awNorm(pan)), shapedRate(awNorm(tilt)));
             noteCmd("aw pts");
         }
         return "sST";
@@ -982,10 +1004,10 @@ static void cgiOk(AsyncWebServerRequest *req, const char *body = "OK") {
 
 static float cgiSpeed(const String &s, float fallbackDiv) {
     int v = s.toInt();
-    if (v <= 0) return g_maxRate * 0.5f;
+    if (v <= 0) return applySpeedExpo(0.5f) * g_maxRate;
     float n = (float) v / fallbackDiv;
     if (n > 1.0f) n = 1.0f;
-    return n * g_maxRate;
+    return applySpeedExpo(n) * g_maxRate;
 }
 
 static void handlePtzOpticsCgi(AsyncWebServerRequest *req) {
