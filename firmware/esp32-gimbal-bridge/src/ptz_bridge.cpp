@@ -911,6 +911,7 @@ static void pumpViscaTcp(TcpSlot &s) {
     }
 }
 
+#if ENABLE_PELCO
 static void pumpPelcoTcp(TcpSlot &s) {
     if (!s.client) return;
     if (!s.client.connected()) {
@@ -935,6 +936,7 @@ static void pumpPelcoTcp(TcpSlot &s) {
         }
     }
 }
+#endif // ENABLE_PELCO
 
 static void ptzTask(void *) {
     for (;;) {
